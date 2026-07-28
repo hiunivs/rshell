@@ -1,0 +1,737 @@
+use crate::app::RShellApp;
+use crate::config::{
+    ColorScheme, DEFAULT_TERMINAL_BACKGROUND_COLOR, PasswordStorage, TERMINAL_BACKGROUND_PRESETS,
+    TerminalBackgroundKind, TerminalImageMode, ThemeMode,
+};
+use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, ThemePreference, Ui, vec2};
+
+/// 设置窗口左侧页面。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPage {
+    Security,
+    General,
+    Shortcuts,
+    Help,
+    About,
+}
+
+impl SettingsPage {
+    fn title(self) -> &'static str {
+        match self {
+            Self::General => "常规",
+            Self::Security => "安全",
+            Self::Shortcuts => "快捷设置",
+            Self::Help => "帮助",
+            Self::About => "关于",
+        }
+    }
+}
+
+impl RShellApp {
+    pub(crate) fn show_settings_dialog(&mut self, ui: &mut Ui) {
+        if !self.show_settings {
+            return;
+        }
+
+        let ctx = ui.ctx().clone();
+        let mut open = self.show_settings;
+        let mut title_close = false;
+        let mut config_changed = false;
+        if self.settings_sub.is_none() {
+            self.settings_sub = Some(SettingsPage::General);
+        }
+
+        egui::Window::new("设置")
+            .id(egui::Id::new("settings_window_v3"))
+            .open(&mut open)
+            .collapsible(false)
+            .title_bar(false)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            .default_size([650.0, 420.0])
+            .frame(crate::ui::dialog::modal_frame(&ctx))
+            .show(&ctx, |ui| {
+                title_close = crate::ui::dialog::title_bar_with_height(
+                    ui,
+                    "设置",
+                    ui.available_width(),
+                    32.0,
+                );
+                Frame::new()
+                    .inner_margin(Margin::symmetric(14, 12))
+                    .show(ui, |ui| {
+                        crate::ui::dialog::polish_compact(ui);
+
+                        let height = ui.available_height();
+                        let body_rect = egui::Rect::from_min_size(
+                            ui.next_widget_position(),
+                            vec2(ui.available_width(), height),
+                        );
+                        let _ = ui.allocate_rect(body_rect, egui::Sense::hover());
+                        let left_width = 150.0;
+                        let column_gap = 10.0;
+                        let left_rect =
+                            egui::Rect::from_min_size(body_rect.min, vec2(left_width, height));
+                        let right_rect = egui::Rect::from_min_max(
+                            egui::pos2(left_rect.right() + column_gap, body_rect.top()),
+                            body_rect.max,
+                        );
+                        let panel_fill = ui.visuals().faint_bg_color;
+                        let panel_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+                        ui.painter().rect(
+                            left_rect,
+                            6.0,
+                            panel_fill,
+                            panel_stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().rect(
+                            right_rect,
+                            6.0,
+                            panel_fill,
+                            panel_stroke,
+                            egui::StrokeKind::Inside,
+                        );
+
+                        let left_content = left_rect.shrink(8.0);
+                        let right_content = right_rect.shrink(14.0);
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
+                            ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .max_rect(left_content)
+                                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                                |ui| {
+                                    ui.label(RichText::new("设置").strong().size(13.0));
+                                    ui.add_space(5.0);
+                                    for page in [
+                                        SettingsPage::General,
+                                        SettingsPage::Security,
+                                        SettingsPage::Shortcuts,
+                                        SettingsPage::Help,
+                                        SettingsPage::About,
+                                    ] {
+                                        if settings_nav_button(
+                                            ui,
+                                            page.title(),
+                                            self.settings_sub == Some(page),
+                                        )
+                                        .clicked()
+                                        {
+                                            self.settings_sub = Some(page);
+                                        }
+                                    }
+                                },
+                            );
+                            ui.scope_builder(
+                                egui::UiBuilder::new()
+                                    .max_rect(right_content)
+                                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                                |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("settings_page_scroll")
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            let page =
+                                                self.settings_sub.unwrap_or(SettingsPage::General);
+
+                                            match page {
+                                                SettingsPage::General => {
+                                                    self.show_general_settings_page(
+                                                        ui,
+                                                        &ctx,
+                                                        &mut config_changed,
+                                                    );
+                                                }
+                                                SettingsPage::Security => {
+                                                    self.show_security_settings_page(ui);
+                                                }
+                                                SettingsPage::Shortcuts => self
+                                                    .show_shortcut_settings_page(
+                                                        ui,
+                                                        &mut config_changed,
+                                                    ),
+                                                SettingsPage::Help => show_help_settings_page(ui),
+                                                SettingsPage::About => show_about_settings_page(ui),
+                                            }
+                                        });
+                                },
+                            );
+                        });
+                    });
+            });
+
+        if title_close {
+            open = false;
+        }
+        if config_changed {
+            self.settings_error = crate::config::save(&self.config)
+                .err()
+                .map(|error| format!("保存设置失败：{error:#}"));
+        }
+        self.show_settings = open;
+    }
+
+    fn show_general_settings_page(
+        &mut self,
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        config_changed: &mut bool,
+    ) {
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            ui.label(RichText::new("外观").strong().size(14.0));
+            ui.add_space(9.0);
+
+            egui::Grid::new("general_settings_grid_v2")
+                .num_columns(2)
+                .spacing([32.0, 14.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, "主题颜色");
+                    let mut theme = self.config.theme_mode;
+                    egui::ComboBox::from_id_salt("theme_color_v2")
+                        .selected_text(theme.label())
+                        .width(190.0)
+                        .show_ui(ui, |ui| {
+                            for option in [ThemeMode::System, ThemeMode::Dark, ThemeMode::Light] {
+                                ui.selectable_value(&mut theme, option, option.label());
+                            }
+                        });
+                    if theme != self.config.theme_mode {
+                        self.config.theme_mode = theme;
+                        self.theme_pref = theme_preference(theme);
+                        ctx.set_theme(self.theme_pref);
+                        apply_native_window_theme(ctx, theme);
+                        apply_color_scheme(ctx, self.config.color_scheme);
+                        *config_changed = true;
+                    }
+                    ui.end_row();
+
+                    settings_row_label(ui, "配色");
+                    let mut scheme = self.config.color_scheme;
+                    egui::ComboBox::from_id_salt("color_scheme_v2")
+                        .selected_text(scheme.label())
+                        .width(190.0)
+                        .show_ui(ui, |ui| {
+                            for option in [
+                                ColorScheme::Blue,
+                                ColorScheme::Green,
+                                ColorScheme::Purple,
+                                ColorScheme::Orange,
+                            ] {
+                                ui.selectable_value(&mut scheme, option, option.label());
+                            }
+                        });
+                    if scheme != self.config.color_scheme {
+                        self.config.color_scheme = scheme;
+                        apply_color_scheme(ctx, scheme);
+                        *config_changed = true;
+                    }
+                    ui.end_row();
+                });
+        });
+
+        ui.add_space(10.0);
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            ui.label(RichText::new("SSH终端").strong().size(14.0));
+            ui.add_space(9.0);
+
+            egui::Grid::new("ssh_terminal_settings")
+                .num_columns(2)
+                .spacing([32.0, 14.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, "字体大小");
+                    let mut font_size = self.config.ssh_terminal.font_size;
+                    egui::ComboBox::from_id_salt("ssh_terminal_font_size")
+                        .selected_text(format!("{font_size}"))
+                        .width(190.0)
+                        .show_ui(ui, |ui| {
+                            for size in 10..=18 {
+                                ui.selectable_value(&mut font_size, size, size.to_string());
+                            }
+                        });
+                    if font_size != self.config.ssh_terminal.font_size {
+                        self.config.ssh_terminal.font_size = font_size;
+                        *config_changed = true;
+                    }
+                    ui.end_row();
+
+                    settings_row_label(ui, "主题配色");
+                    ui.add_enabled_ui(false, |ui| {
+                        egui::ComboBox::from_id_salt("ssh_terminal_theme_placeholder")
+                            .selected_text("默认")
+                            .width(190.0)
+                            .show_ui(ui, |_ui| {});
+                    });
+                    ui.end_row();
+                });
+        });
+
+        ui.add_space(10.0);
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            ui.label(RichText::new("终端背景").strong().size(14.0));
+            ui.add_space(9.0);
+
+            egui::Grid::new("terminal_background_settings")
+                .num_columns(2)
+                .spacing([32.0, 12.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, "背景类型");
+                    let mut kind = self.config.terminal_background.kind;
+                    egui::ComboBox::from_id_salt("terminal_background_kind")
+                        .selected_text(kind.label())
+                        .width(190.0)
+                        .show_ui(ui, |ui| {
+                            for option in
+                                [TerminalBackgroundKind::Solid, TerminalBackgroundKind::Image]
+                            {
+                                ui.selectable_value(&mut kind, option, option.label());
+                            }
+                        });
+                    if kind != self.config.terminal_background.kind {
+                        self.config.terminal_background.kind = kind;
+                        *config_changed = true;
+                    }
+                    ui.end_row();
+
+                    if kind == TerminalBackgroundKind::Solid {
+                        settings_row_label(ui, "背景颜色");
+                        ui.allocate_ui_with_layout(
+                            vec2(190.0, 28.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                // 项目主题会为 hovered/active 状态设置 expansion。
+                                // 色块紧邻区域底边时，扩展绘制看起来像外框上下跳动；
+                                // 此处保持各交互状态尺寸完全一致。
+                                let widgets = &mut ui.visuals_mut().widgets;
+                                widgets.inactive.expansion = 0.0;
+                                widgets.hovered.expansion = 0.0;
+                                widgets.active.expansion = 0.0;
+                                widgets.open.expansion = 0.0;
+                                for (index, preset) in
+                                    TERMINAL_BACKGROUND_PRESETS.iter().copied().enumerate()
+                                {
+                                    let selected = self.config.terminal_background.color == preset;
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        vec2(28.0, 26.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let response = response
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text(format!("预设颜色 {}", index + 1));
+                                    // 色块与选中框都画在固定响应区域内部，不使用
+                                    // Button 的交互态边框，避免 hover 前后尺寸变化。
+                                    let color_rect = egui::Rect::from_center_size(
+                                        rect.center(),
+                                        vec2(20.0, 18.0),
+                                    );
+                                    ui.painter().rect(
+                                        color_rect,
+                                        3.0,
+                                        Color32::from_rgb(preset[0], preset[1], preset[2]),
+                                        ui.visuals().widgets.noninteractive.bg_stroke,
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    if selected {
+                                        ui.painter().rect_stroke(
+                                            color_rect.expand(3.0),
+                                            5.0,
+                                            Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    if response.clicked() && !selected {
+                                        self.config.terminal_background.color = preset;
+                                        *config_changed = true;
+                                    }
+                                }
+
+                                if ui
+                                    .color_edit_button_srgb(
+                                        &mut self.config.terminal_background.color,
+                                    )
+                                    .on_hover_text("自定义颜色")
+                                    .changed()
+                                {
+                                    *config_changed = true;
+                                }
+
+                                if ui.small_button("恢复默认").clicked()
+                                    && self.config.terminal_background.color
+                                        != DEFAULT_TERMINAL_BACKGROUND_COLOR
+                                {
+                                    self.config.terminal_background.color =
+                                        DEFAULT_TERMINAL_BACKGROUND_COLOR;
+                                    *config_changed = true;
+                                }
+                            },
+                        );
+                        ui.end_row();
+                    } else {
+                        settings_row_label(ui, "背景图片");
+                        ui.horizontal(|ui| {
+                            if ui.button("选择图片").clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("图片", &["png", "jpg", "jpeg"])
+                                    .pick_file()
+                            {
+                                self.config.terminal_background.image_path =
+                                    path.to_string_lossy().into_owned();
+                                self.terminal_background_texture = None;
+                                self.terminal_background_load_attempt = None;
+                                self.terminal_background_error = None;
+                                *config_changed = true;
+                            }
+                            let has_image =
+                                !self.config.terminal_background.image_path.trim().is_empty();
+                            if ui
+                                .add_enabled(has_image, egui::Button::new("清除"))
+                                .clicked()
+                            {
+                                self.config.terminal_background.image_path.clear();
+                                self.terminal_background_texture = None;
+                                self.terminal_background_load_attempt = None;
+                                self.terminal_background_error = None;
+                                *config_changed = true;
+                            }
+                        });
+                        ui.end_row();
+
+                        settings_row_label(ui, "显示方式");
+                        let mut mode = self.config.terminal_background.image_mode;
+                        egui::ComboBox::from_id_salt("terminal_background_image_mode")
+                            .selected_text(mode.label())
+                            .width(190.0)
+                            .show_ui(ui, |ui| {
+                                for option in [
+                                    TerminalImageMode::Fill,
+                                    TerminalImageMode::Fit,
+                                    TerminalImageMode::Stretch,
+                                    TerminalImageMode::Center,
+                                    TerminalImageMode::Tile,
+                                ] {
+                                    ui.selectable_value(&mut mode, option, option.label());
+                                }
+                            });
+                        if mode != self.config.terminal_background.image_mode {
+                            self.config.terminal_background.image_mode = mode;
+                            *config_changed = true;
+                        }
+                        ui.end_row();
+
+                        settings_row_label(ui, "图片暗度");
+                        if ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut self.config.terminal_background.image_darkness,
+                                    0..=100,
+                                )
+                                .suffix("%")
+                                .show_value(true),
+                            )
+                            .changed()
+                        {
+                            *config_changed = true;
+                        }
+                        ui.end_row();
+                    }
+                });
+
+            if self.config.terminal_background.kind == TerminalBackgroundKind::Image {
+                let path = self.config.terminal_background.image_path.trim();
+                if !path.is_empty() {
+                    ui.add_space(7.0);
+                    let filename = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(path);
+                    ui.label(RichText::new(filename).weak()).on_hover_text(path);
+                }
+                if let Some(error) = &self.terminal_background_error {
+                    ui.add_space(5.0);
+                    ui.colored_label(Color32::from_rgb(0xE8, 0x4C, 0x3D), error);
+                }
+            }
+        });
+
+        self.show_settings_error(ui);
+    }
+
+    fn show_security_settings_page(&mut self, ui: &mut Ui) {
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            ui.label(RichText::new("凭据").strong().size(14.0));
+            ui.add_space(9.0);
+
+            egui::Grid::new("security_settings_grid_v2")
+                .num_columns(2)
+                .spacing([24.0, 12.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, "密码保存方式");
+                    let current = self.config.password_storage;
+                    let mut selected = current;
+                    egui::ComboBox::from_id_salt("password_storage_v2")
+                        .selected_text(selected.label())
+                        .width(190.0)
+                        .show_ui(ui, |ui| {
+                            for storage in [
+                                PasswordStorage::SystemKeyring,
+                                PasswordStorage::AppEncrypted,
+                            ] {
+                                ui.selectable_value(&mut selected, storage, storage.label());
+                            }
+                        });
+                    if selected != current {
+                        self.change_password_storage(current, selected);
+                    }
+                    ui.end_row();
+                });
+        });
+
+        ui.add_space(12.0);
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            ui.label(RichText::new("主机验证").strong().size(14.0));
+            ui.add_space(8.0);
+            ui.label("SSH 主机指纹记录");
+            ui.label(RichText::new("known_hosts.toml").weak().small());
+        });
+
+        self.show_settings_error(ui);
+    }
+
+    fn show_shortcut_settings_page(&mut self, ui: &mut Ui, config_changed: &mut bool) {
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            egui::Grid::new("shortcut_settings_grid")
+                .num_columns(2)
+                .spacing([32.0, 14.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, "右键粘贴");
+                    let mut changed = false;
+                    ui.allocate_ui_with_layout(
+                        vec2(260.0, 24.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            changed =
+                                settings_toggle(ui, &mut self.config.shortcuts.right_click_paste)
+                                    .changed();
+                        },
+                    );
+                    if changed {
+                        *config_changed = true;
+                    }
+                    ui.end_row();
+                });
+        });
+
+        self.show_settings_error(ui);
+    }
+
+    fn show_settings_error(&self, ui: &mut Ui) {
+        if let Some(error) = &self.settings_error {
+            ui.add_space(10.0);
+            ui.colored_label(Color32::from_rgb(0xE8, 0x4C, 0x3D), error);
+        }
+    }
+
+    fn change_password_storage(&mut self, from: PasswordStorage, to: PasswordStorage) {
+        let mut accounts: Vec<String> = self
+            .config
+            .connections
+            .iter()
+            .map(|connection| {
+                crate::secrets::account_for(&connection.user, &connection.host, connection.port)
+            })
+            .chain(
+                self.config
+                    .keys
+                    .iter()
+                    .map(|key| crate::keys::key_account(&key.id)),
+            )
+            .collect();
+        accounts.sort();
+        accounts.dedup();
+        match crate::secrets::switch_backend(from, to, &accounts) {
+            Ok(()) => {
+                self.config.password_storage = to;
+                match crate::config::save(&self.config) {
+                    Ok(()) => self.settings_error = None,
+                    Err(error) => {
+                        self.settings_error = Some(format!("保存设置失败：{error:#}"));
+                    }
+                }
+            }
+            Err(error) => {
+                self.settings_error = Some(format!("切换密码保存方式失败：{error}"));
+            }
+        }
+    }
+}
+
+fn settings_nav_button(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
+    let width = ui.available_width();
+    ui.add_sized(
+        [width, 34.0],
+        egui::Button::new(RichText::new(label).size(14.0))
+            .selected(selected)
+            .corner_radius(CornerRadius::same(6)),
+    )
+}
+
+fn settings_section_frame(ui: &Ui) -> Frame {
+    let dark = ui.visuals().dark_mode;
+    Frame::new()
+        .fill(if dark {
+            Color32::from_rgb(39, 40, 44)
+        } else {
+            Color32::from_rgb(249, 249, 250)
+        })
+        .stroke(Stroke::new(
+            1.0,
+            if dark {
+                Color32::from_rgb(61, 63, 68)
+            } else {
+                Color32::from_rgb(226, 227, 230)
+            },
+        ))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(16, 14))
+}
+
+fn settings_row_label(ui: &mut Ui, title: &str) {
+    ui.add_sized([104.0, 24.0], egui::Label::new(title));
+}
+
+fn settings_toggle(ui: &mut Ui, value: &mut bool) -> egui::Response {
+    let (rect, mut response) = ui.allocate_exact_size(vec2(38.0, 22.0), egui::Sense::click());
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let animation = ui.ctx().animate_bool(response.id, *value);
+    let track = rect.shrink(1.0);
+    let mut fill = if *value {
+        ui.visuals().selection.bg_fill
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+    if response.hovered() {
+        fill = fill.gamma_multiply(1.12);
+    }
+    ui.painter().rect(
+        track,
+        track.height() * 0.5,
+        fill,
+        ui.visuals().widgets.noninteractive.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let knob_x = egui::lerp((track.left() + 10.0)..=(track.right() - 10.0), animation);
+    ui.painter()
+        .circle_filled(egui::pos2(knob_x, track.center().y), 8.0, Color32::WHITE);
+    response
+}
+
+fn show_help_settings_page(ui: &mut Ui) {
+    settings_section_frame(ui).show(ui, |ui| {
+        ui.set_width(396.0);
+        ui.label(RichText::new("常用操作").strong().size(14.0));
+        ui.add_space(10.0);
+        for (title, detail) in [
+            ("连接", "在 SSH 启动页双击已保存的连接，或新建本机终端。"),
+            (
+                "文件",
+                "双击进入目录，右键打开更多操作；支持拖放上传文件和目录。",
+            ),
+            ("终端", "使用底部命令栏发送命令，按上下方向键浏览历史记录。"),
+            ("复制", "在终端中选中文字后，按 Ctrl+C 复制选区。"),
+        ] {
+            ui.label(RichText::new(title).strong());
+            ui.label(RichText::new(detail).weak().small());
+            ui.add_space(8.0);
+        }
+    });
+}
+
+fn show_about_settings_page(ui: &mut Ui) {
+    let accent = ui.visuals().selection.bg_fill;
+    let secondary = ui.visuals().weak_text_color();
+    settings_section_frame(ui).show(ui, |ui| {
+        ui.set_width(396.0);
+        ui.vertical_centered(|ui| {
+            ui.add_space(10.0);
+            let (logo_rect, _) = ui.allocate_exact_size(vec2(52.0, 52.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(logo_rect, CornerRadius::same(12), accent);
+            ui.painter().text(
+                logo_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "R",
+                egui::FontId::proportional(28.0),
+                Color32::WHITE,
+            );
+            ui.add_space(9.0);
+            ui.label(RichText::new("RShell").strong().size(22.0));
+            ui.label(
+                RichText::new(format!("版本 {}", env!("CARGO_PKG_VERSION")))
+                    .color(secondary)
+                    .size(12.0),
+            );
+            ui.add_space(10.0);
+            ui.label("轻量、可靠的 SSH 终端与服务器管理工具");
+            ui.label(
+                RichText::new("Rust · egui · russh")
+                    .color(secondary)
+                    .size(11.0),
+            );
+            ui.add_space(10.0);
+        });
+    });
+}
+
+fn theme_preference(theme: ThemeMode) -> ThemePreference {
+    match theme {
+        ThemeMode::System => ThemePreference::System,
+        ThemeMode::Dark => ThemePreference::Dark,
+        ThemeMode::Light => ThemePreference::Light,
+    }
+}
+
+pub(crate) fn apply_native_window_theme(ctx: &egui::Context, theme: ThemeMode) {
+    let native_theme = match theme {
+        ThemeMode::System => egui::SystemTheme::SystemDefault,
+        ThemeMode::Dark => egui::SystemTheme::Dark,
+        ThemeMode::Light => egui::SystemTheme::Light,
+    };
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(native_theme));
+}
+
+pub(crate) fn apply_color_scheme(ctx: &egui::Context, scheme: ColorScheme) {
+    let color = match scheme {
+        ColorScheme::Blue => Color32::from_rgb(0x3C, 0x82, 0xE8),
+        ColorScheme::Green => Color32::from_rgb(0x35, 0xA8, 0x67),
+        ColorScheme::Purple => Color32::from_rgb(0x8A, 0x63, 0xD2),
+        ColorScheme::Orange => Color32::from_rgb(0xD9, 0x78, 0x32),
+    };
+    ctx.all_styles_mut(|style| {
+        // egui 默认 Window 使用 Heading 绘制标题；统一到自定义标题栏的 16px。
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(16.0));
+        // 默认窗口激活时不再叠加深色标题栏阴影，保持与连接库一致。
+        style.visuals.widgets.open.weak_bg_fill = if style.visuals.dark_mode {
+            Color32::from_rgb(35, 36, 39)
+        } else {
+            Color32::from_rgb(246, 246, 247)
+        };
+        style.visuals.selection.bg_fill = color;
+        style.visuals.hyperlink_color = color;
+        style.visuals.widgets.active.bg_fill = color;
+        style.visuals.widgets.active.bg_stroke.color = color;
+        style.visuals.widgets.hovered.bg_stroke.color = color;
+    });
+}
