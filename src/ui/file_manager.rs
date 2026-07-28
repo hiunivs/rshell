@@ -991,6 +991,8 @@ fn fm_transfers(ui: &mut egui::Ui, fm: &mut FileManager, max_height: f32, pos: T
                                 .color(Color32::from_rgb(0xD8, 0x3A, 0x3A))
                         } else if t.finished {
                             RichText::new("完成").color(Color32::from_rgb(0x35, 0xA8, 0x60))
+                        } else if t.total == 0 {
+                            RichText::new(fmt_bytes(t.done))
                         } else {
                             RichText::new(format!("{}/{}", fmt_bytes(t.done), fmt_bytes(t.total)))
                         });

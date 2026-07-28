@@ -1,4 +1,5 @@
 use crate::app::RShellApp;
+use crate::ui::file_manager::draw_folder_icon;
 use egui::{Color32, RichText, vec2};
 
 /// 密钥表单模式
@@ -283,7 +284,7 @@ impl RShellApp {
                 }
             }
             let (icon_rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
-            draw_folder(
+            draw_folder_icon(
                 &ui.painter_at(icon_rect),
                 icon_rect,
                 if root_selected {
@@ -362,7 +363,7 @@ impl RShellApp {
                 }
                 let (ir, _) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
                 let fp = ui.painter_at(ir);
-                draw_folder(
+                draw_folder_icon(
                     &fp,
                     ir,
                     if sel {
@@ -1916,10 +1917,6 @@ pub(crate) fn parse_tags(s: &str) -> Vec<String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect()
-}
-
-fn draw_folder(p: &egui::Painter, r: egui::Rect, c: Color32) {
-    crate::ui::file_manager::draw_folder_icon(p, r, c);
 }
 
 fn tag_chip(ui: &mut egui::Ui, t: &str) {
