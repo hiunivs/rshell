@@ -67,17 +67,23 @@ impl RShellApp {
                         vec2(x_box, x_box),
                     );
                     let x_resp = ui.interact(x_rect, ui.id().with(("tab_x", i)), Sense::click());
+                    let x_hovered = x_resp.hovered();
                     let x_clicked = x_resp.clicked();
                     let x_middle_clicked = x_resp.clicked_by(egui::PointerButton::Middle);
                     x_resp
                         .on_hover_cursor(CursorIcon::PointingHand)
                         .on_hover_text("关闭会话");
+                    let x_color = if x_hovered {
+                        Color32::from_rgb(0xE8, 0x4C, 0x3D)
+                    } else {
+                        text_color
+                    };
                     ui.painter().text(
                         x_rect.center(),
                         Align2::CENTER_CENTER,
                         "×",
                         FontId::proportional(13.0),
-                        text_color,
+                        x_color,
                     );
                     if x_clicked
                         || (middle_click_closes
