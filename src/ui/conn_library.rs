@@ -1,5 +1,6 @@
 use crate::app::RShellApp;
 use crate::ui::file_manager::draw_folder_icon;
+use crate::ui::icons::{Icon, icon_button};
 use egui::{Color32, RichText, vec2};
 
 /// 密钥表单模式
@@ -61,18 +62,54 @@ impl RShellApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("导入").clicked() {
+                                    if ui
+                                        .add(
+                                            egui::Button::image_and_text(
+                                                Icon::Download.image(14.0, Color32::WHITE),
+                                                "导入",
+                                            )
+                                            .image_tint_follows_text_color(true),
+                                        )
+                                        .clicked()
+                                    {
                                         self.open_connection_import();
                                     }
-                                    if ui.button("导出").clicked() {
+                                    if ui
+                                        .add(
+                                            egui::Button::image_and_text(
+                                                Icon::Upload.image(14.0, Color32::WHITE),
+                                                "导出",
+                                            )
+                                            .image_tint_follows_text_color(true),
+                                        )
+                                        .clicked()
+                                    {
                                         self.open_connection_export(
                                             crate::export::ConnectionExportScope::All,
                                         );
                                     }
-                                    if ui.button("管理密钥").clicked() {
+                                    if ui
+                                        .add(
+                                            egui::Button::image_and_text(
+                                                Icon::KeyRound.image(14.0, Color32::WHITE),
+                                                "管理密钥",
+                                            )
+                                            .image_tint_follows_text_color(true),
+                                        )
+                                        .clicked()
+                                    {
                                         self.show_keys = true;
                                     }
-                                    if ui.button("＋ 连接").clicked() {
+                                    if ui
+                                        .add(
+                                            egui::Button::image_and_text(
+                                                Icon::Plus.image(14.0, Color32::WHITE),
+                                                "连接",
+                                            )
+                                            .image_tint_follows_text_color(true),
+                                        )
+                                        .clicked()
+                                    {
                                         self.open_lib_new();
                                     }
                                 },
@@ -150,7 +187,16 @@ impl RShellApp {
                                             egui::Layout::left_to_right(egui::Align::Center),
                                         ),
                                         |ui| {
-                                            if ui.button("＋ 文件夹").clicked() {
+                                            if ui
+                                                .add(
+                                                    egui::Button::image_and_text(
+                                                        Icon::Plus.image(13.0, Color32::WHITE),
+                                                        "文件夹",
+                                                    )
+                                                    .image_tint_follows_text_color(true),
+                                                )
+                                                .clicked()
+                                            {
                                                 self.open_folder_new();
                                             }
                                             let has = self.lib_folder.is_some();
@@ -227,14 +273,28 @@ impl RShellApp {
                                                 self.lib_connect(&ctx);
                                             }
                                             if ui
-                                                .add_enabled(has, egui::Button::new("编辑"))
+                                                .add_enabled(
+                                                    has,
+                                                    egui::Button::image_and_text(
+                                                        Icon::Pencil.image(13.0, Color32::WHITE),
+                                                        "编辑",
+                                                    )
+                                                    .image_tint_follows_text_color(true),
+                                                )
                                                 .clicked()
                                                 && let Some(name) = self.lib_conn.clone()
                                             {
                                                 self.open_lib_edit(&name);
                                             }
                                             if ui
-                                                .add_enabled(has, egui::Button::new("删除"))
+                                                .add_enabled(
+                                                    has,
+                                                    egui::Button::image_and_text(
+                                                        Icon::Trash.image(13.0, Color32::WHITE),
+                                                        "删除",
+                                                    )
+                                                    .image_tint_follows_text_color(true),
+                                                )
                                                 .clicked()
                                             {
                                                 self.lib_delete();
@@ -264,15 +324,20 @@ impl RShellApp {
             if folders.is_empty() {
                 ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
             } else {
-                let arrow = if root_collapsed { "▲" } else { "▼" };
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new(arrow).size(9.0))
-                            .frame(false)
-                            .min_size(vec2(14.0, 14.0)),
-                    )
-                    .on_hover_text(if root_collapsed { "展开" } else { "折叠" })
-                    .clicked()
+                let icon = if root_collapsed {
+                    Icon::ChevronRight
+                } else {
+                    Icon::ChevronDown
+                };
+                if icon_button(
+                    ui,
+                    icon,
+                    if root_collapsed { "展开" } else { "折叠" },
+                    vec2(14.0, 14.0),
+                    10.0,
+                    ui.visuals().weak_text_color(),
+                )
+                .clicked()
                 {
                     if root_collapsed {
                         self.lib_collapsed_folders.remove(LIB_ROOT_NODE);
@@ -285,7 +350,7 @@ impl RShellApp {
             }
             let (icon_rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
             draw_folder_icon(
-                &ui.painter_at(icon_rect),
+                ui,
                 icon_rect,
                 if root_selected {
                     Color32::from_rgb(0x4C, 0x9B, 0xE8)
@@ -332,16 +397,20 @@ impl RShellApp {
             let collapsed = self.lib_collapsed_folders.contains(&f);
             ui.horizontal(|ui| {
                 if has_children {
-                    // ▸/▾ 不在当前字体回退链中；沿用文件列表已验证的 ▲/▼ 字形。
-                    let arrow = if collapsed { "▲" } else { "▼" };
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new(arrow).size(9.0))
-                                .frame(false)
-                                .min_size(vec2(14.0, 14.0)),
-                        )
-                        .on_hover_text(if collapsed { "展开" } else { "折叠" })
-                        .clicked()
+                    let icon = if collapsed {
+                        Icon::ChevronRight
+                    } else {
+                        Icon::ChevronDown
+                    };
+                    if icon_button(
+                        ui,
+                        icon,
+                        if collapsed { "展开" } else { "折叠" },
+                        vec2(14.0, 14.0),
+                        10.0,
+                        ui.visuals().weak_text_color(),
+                    )
+                    .clicked()
                     {
                         if collapsed {
                             self.lib_collapsed_folders.remove(&f);
@@ -362,9 +431,8 @@ impl RShellApp {
                     ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
                 }
                 let (ir, _) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
-                let fp = ui.painter_at(ir);
                 draw_folder_icon(
-                    &fp,
+                    ui,
                     ir,
                     if sel {
                         Color32::from_rgb(0x4C, 0x9B, 0xE8)
@@ -422,7 +490,6 @@ impl RShellApp {
                 None => true,
                 Some(f) => &c.group == f,
             })
-            .cloned()
             .collect();
         if conns.is_empty() {
             ui.label(RichText::new("（空，点右上 ＋ 连接 添加）").weak());
@@ -431,10 +498,8 @@ impl RShellApp {
         let mut act: Option<(String, LibConnAction)> = None;
         for (row_index, c) in conns.into_iter().enumerate() {
             let sel = self.lib_conn.as_deref() == Some(&c.name);
-            // 预计算,避免在 horizontal 闭包里借 self.config
-            let dn = c.display_name().to_string();
-            let tags = c.tags.clone();
-            let kl = key_label(&c, &self.config);
+            let dn = c.display_name();
+            let kl = key_label(c, &self.config);
             let fill = if sel {
                 ui.visuals().selection.bg_fill.gamma_multiply(0.55)
             } else if row_index % 2 == 0 {
@@ -450,11 +515,11 @@ impl RShellApp {
                     ui.set_min_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(if sel {
-                            RichText::new(&dn).strong()
+                            RichText::new(dn).strong()
                         } else {
-                            RichText::new(&dn)
+                            RichText::new(dn)
                         });
-                        for t in &tags {
+                        for t in &c.tags {
                             tag_chip(ui, t);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -476,12 +541,10 @@ impl RShellApp {
                 );
             }
             if resp.clicked() {
-                self.lib_conn = Some(c.name.clone());
-                self.lib_error = None;
+                act = Some((c.name.clone(), LibConnAction::Select));
             }
             if resp.double_clicked() {
-                self.lib_conn = Some(c.name.clone());
-                self.lib_connect(ctx);
+                act = Some((c.name.clone(), LibConnAction::Connect));
             }
             resp.context_menu(|ui| {
                 if ui.button("连接").clicked() {
@@ -516,6 +579,10 @@ impl RShellApp {
         }
         if let Some((name, a)) = act {
             match a {
+                LibConnAction::Select => {
+                    self.lib_conn = Some(name);
+                    self.lib_error = None;
+                }
                 LibConnAction::Connect => {
                     self.lib_conn = Some(name);
                     self.lib_connect(ctx);
@@ -1819,6 +1886,7 @@ fn short_fp(fp: &str) -> String {
 
 #[derive(Clone, Copy)]
 enum LibConnAction {
+    Select,
     Connect,
     Edit,
     Delete,

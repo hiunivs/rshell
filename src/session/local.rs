@@ -7,7 +7,7 @@ use anyhow::Context as _;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use super::files::{self, sftp_channel};
-use super::{SessionChannels, SessionCmd, SessionEvent, cmd_channel};
+use super::{SessionChannels, SessionCmd, SessionEvent, cmd_channel, data_channel};
 
 /// 启动本地 shell + 文件服务,返回会话通道。
 pub fn spawn(cols: u16, rows: u16, ctx: egui::Context) -> anyhow::Result<SessionChannels> {
@@ -53,6 +53,7 @@ pub fn spawn(cols: u16, rows: u16, ctx: egui::Context) -> anyhow::Result<Session
     let master = pair.master;
 
     let (cmd_tx, mut cmd_rx) = cmd_channel();
+    let (data_tx, data_rx) = data_channel();
     let (event_tx, event_rx) = channel::<SessionEvent>();
 
     // 文件服务线程(本机目录浏览/文件操作)
@@ -70,10 +71,7 @@ pub fn spawn(cols: u16, rows: u16, ctx: egui::Context) -> anyhow::Result<Session
                     break;
                 }
                 Ok(n) => {
-                    if event_tx
-                        .send(SessionEvent::Data(buf[..n].to_vec()))
-                        .is_err()
-                    {
+                    if data_tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                     ctx.request_repaint();
@@ -117,6 +115,7 @@ pub fn spawn(cols: u16, rows: u16, ctx: egui::Context) -> anyhow::Result<Session
 
     Ok(SessionChannels {
         cmd_tx,
+        data_rx,
         event_rx,
         sftp_tx,
     })
@@ -130,7 +129,7 @@ mod tests {
     /// 端到端验证 pty:写入 echo 命令,读回应含标记串
     #[test]
     fn echo_roundtrip() {
-        let ch = spawn(80, 24, egui::Context::default()).unwrap();
+        let mut ch = spawn(80, 24, egui::Context::default()).unwrap();
         let marker = "RSHELL_TEST_MARKER_7f3a9";
         ch.cmd_tx
             .send(SessionCmd::Input(format!("echo {marker}\r").into_bytes()))
@@ -139,13 +138,13 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut output = Vec::new();
         while Instant::now() < deadline {
-            match ch.event_rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(SessionEvent::Data(data)) => {
-                    output.extend_from_slice(&data);
-                    if String::from_utf8_lossy(&output).contains(marker) {
-                        return; // 成功
-                    }
+            while let Ok(data) = ch.data_rx.try_recv() {
+                output.extend_from_slice(&data);
+                if String::from_utf8_lossy(&output).contains(marker) {
+                    return;
                 }
+            }
+            match ch.event_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(SessionEvent::Exited) => panic!("shell exited unexpectedly"),
                 Ok(SessionEvent::Metrics(_)) => {}
                 Ok(SessionEvent::Sftp(_)) => {}

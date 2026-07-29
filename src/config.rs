@@ -158,12 +158,26 @@ impl Default for TerminalBackground {
 #[serde(default)]
 pub struct SshTerminalSettings {
     pub font_size: u8,
+    /// 终端正文使用的等宽字体族；"Hack" 为程序内置默认字体。
+    pub font_family: String,
 }
 
 impl Default for SshTerminalSettings {
     fn default() -> Self {
-        Self { font_size: 13 }
+        Self {
+            font_size: 13,
+            font_family: "Hack".into(),
+        }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct EditorSettings {
+    /// 关闭编辑器窗口时保留当前打开的文件标签，下一次打开编辑器时恢复。
+    pub remember_open_files: bool,
+    /// 编辑器正文超过可用宽度时自动折行。
+    pub auto_wrap: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -171,6 +185,75 @@ impl Default for SshTerminalSettings {
 pub struct ShortcutSettings {
     /// 在终端输出区域单击鼠标右键时请求系统剪贴板内容并粘贴。
     pub right_click_paste: bool,
+}
+
+/// 下载路径的选择方式。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadPathMode {
+    /// 每次下载都弹出系统保存对话框。
+    #[default]
+    AskEachTime,
+    /// 静默下载到指定目录(同名文件直接覆盖)。
+    FixedDirectory,
+}
+
+impl DownloadPathMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AskEachTime => "每次询问",
+            Self::FixedDirectory => "指定目录",
+        }
+    }
+}
+
+/// 用本地程序打开远程文件时的程序选择。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOpenMode {
+    /// 操作系统默认关联程序(macOS open / Linux xdg-open / Windows start)
+    #[default]
+    SystemDefault,
+    /// 用户指定的程序
+    CustomProgram,
+}
+
+impl FileOpenMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SystemDefault => "系统默认",
+            Self::CustomProgram => "自定义程序",
+        }
+    }
+}
+
+/// 文件上传/下载的设置。
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct TransferSettings {
+    pub download_mode: DownloadPathMode,
+    /// download_mode = fixed_directory 时的目标目录。
+    pub download_dir: String,
+    /// "用本地程序打开"的程序选择。
+    pub open_mode: FileOpenMode,
+    /// open_mode = custom_program 时的程序路径(macOS 也可以是 .app 名称)。
+    pub open_program: String,
+}
+
+impl TransferSettings {
+    /// 生效的固定下载目录;未选固定模式、目录为空或已不存在时返回 None
+    /// (调用方应回退为每次询问)。
+    pub fn effective_download_dir(&self) -> Option<&str> {
+        if self.download_mode != DownloadPathMode::FixedDirectory {
+            return None;
+        }
+        let dir = self.download_dir.trim();
+        if !dir.is_empty() && std::path::Path::new(dir).is_dir() {
+            Some(dir)
+        } else {
+            None
+        }
+    }
 }
 
 /// 一个已保存的连接。`name`(=user@host:port) 仍是稳定主键。
@@ -254,8 +337,12 @@ pub struct AppConfig {
     pub terminal_background: TerminalBackground,
     /// SSH/本机终端的显示设置。
     pub ssh_terminal: SshTerminalSettings,
+    /// 内建编辑器设置。
+    pub editor: EditorSettings,
     /// 鼠标与键盘快捷操作。
     pub shortcuts: ShortcutSettings,
+    /// 文件上传/下载设置。
+    pub transfers: TransferSettings,
     /// 上次退出时主窗口内容区域的宽度和高度。
     pub window_width: Option<f32>,
     pub window_height: Option<f32>,
@@ -399,7 +486,35 @@ key_path = ""
         assert_eq!(cfg.terminal_background.color, [0x1B, 0x2B, 0x3A]);
         assert_eq!(cfg.terminal_background.image_darkness, 45);
         assert_eq!(cfg.ssh_terminal.font_size, 13);
+        assert_eq!(cfg.ssh_terminal.font_family, "Hack");
+        assert!(!cfg.editor.remember_open_files);
+        assert!(!cfg.editor.auto_wrap);
         assert!(!cfg.shortcuts.right_click_paste);
+        assert_eq!(cfg.transfers.download_mode, DownloadPathMode::AskEachTime);
+        assert!(cfg.transfers.download_dir.is_empty());
+    }
+
+    /// 传输设置:固定目录模式与目录有效性回退
+    #[test]
+    fn transfer_settings_roundtrip_and_fallback() {
+        let mut cfg = AppConfig::default();
+        cfg.transfers.download_mode = DownloadPathMode::FixedDirectory;
+        cfg.transfers.download_dir = "/tmp".into();
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: AppConfig = toml::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.transfers.download_mode,
+            DownloadPathMode::FixedDirectory
+        );
+        assert_eq!(parsed.transfers.effective_download_dir(), Some("/tmp"));
+
+        // 每次询问模式 / 空目录 / 不存在的目录都回退 None
+        let mut ts = TransferSettings::default();
+        assert_eq!(ts.effective_download_dir(), None);
+        ts.download_mode = DownloadPathMode::FixedDirectory;
+        assert_eq!(ts.effective_download_dir(), None);
+        ts.download_dir = "/nonexistent-rshell-dir".into();
+        assert_eq!(ts.effective_download_dir(), None);
     }
 
     /// 新字段往返
@@ -421,6 +536,9 @@ key_path = ""
         cfg.terminal_background.image_mode = TerminalImageMode::Fit;
         cfg.terminal_background.image_darkness = 60;
         cfg.ssh_terminal.font_size = 18;
+        cfg.ssh_terminal.font_family = "Test Mono".into();
+        cfg.editor.remember_open_files = true;
+        cfg.editor.auto_wrap = true;
         cfg.shortcuts.right_click_paste = true;
         cfg.window_width = Some(1360.0);
         cfg.window_height = Some(860.0);
@@ -453,6 +571,9 @@ key_path = ""
         );
         assert_eq!(parsed.terminal_background.image_darkness, 60);
         assert_eq!(parsed.ssh_terminal.font_size, 18);
+        assert_eq!(parsed.ssh_terminal.font_family, "Test Mono");
+        assert!(parsed.editor.remember_open_files);
+        assert!(parsed.editor.auto_wrap);
         assert!(parsed.shortcuts.right_click_paste);
         assert_eq!(parsed.window_size(), Some([1360.0, 860.0]));
         let c = &parsed.connections[0];

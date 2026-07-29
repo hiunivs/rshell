@@ -1,7 +1,8 @@
 use crate::app::RShellApp;
 use crate::config::{
-    ColorScheme, DEFAULT_TERMINAL_BACKGROUND_COLOR, PasswordStorage, TERMINAL_BACKGROUND_PRESETS,
-    TerminalBackgroundKind, TerminalImageMode, ThemeMode,
+    ColorScheme, DEFAULT_TERMINAL_BACKGROUND_COLOR, DownloadPathMode, FileOpenMode,
+    PasswordStorage, TERMINAL_BACKGROUND_PRESETS, TerminalBackgroundKind, TerminalImageMode,
+    ThemeMode,
 };
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, ThemePreference, Ui, vec2};
 
@@ -10,6 +11,8 @@ use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, ThemePreferen
 pub enum SettingsPage {
     Security,
     General,
+    Transfers,
+    Editor,
     Shortcuts,
     Help,
     About,
@@ -19,6 +22,8 @@ impl SettingsPage {
     fn title(self) -> &'static str {
         match self {
             Self::General => "常规",
+            Self::Transfers => "传输设置",
+            Self::Editor => "编辑器",
             Self::Security => "安全",
             Self::Shortcuts => "快捷设置",
             Self::Help => "帮助",
@@ -106,7 +111,9 @@ impl RShellApp {
                                     ui.add_space(5.0);
                                     for page in [
                                         SettingsPage::General,
+                                        SettingsPage::Transfers,
                                         SettingsPage::Security,
+                                        SettingsPage::Editor,
                                         SettingsPage::Shortcuts,
                                         SettingsPage::Help,
                                         SettingsPage::About,
@@ -143,9 +150,19 @@ impl RShellApp {
                                                         &mut config_changed,
                                                     );
                                                 }
+                                                SettingsPage::Transfers => self
+                                                    .show_transfer_settings_page(
+                                                        ui,
+                                                        &mut config_changed,
+                                                    ),
                                                 SettingsPage::Security => {
                                                     self.show_security_settings_page(ui);
                                                 }
+                                                SettingsPage::Editor => self
+                                                    .show_editor_settings_page(
+                                                        ui,
+                                                        &mut config_changed,
+                                                    ),
                                                 SettingsPage::Shortcuts => self
                                                     .show_shortcut_settings_page(
                                                         ui,
@@ -241,6 +258,23 @@ impl RShellApp {
                 .num_columns(2)
                 .spacing([32.0, 14.0])
                 .show(ui, |ui| {
+                    settings_row_label(ui, "字体");
+                    let mut font_family = self.config.ssh_terminal.font_family.clone();
+                    let combo = egui::ComboBox::from_id_salt("ssh_terminal_font_family")
+                        .selected_text(&font_family)
+                        .width(190.0)
+                        .show_ui(ui, |ui| {
+                            for family in crate::terminal_font_families() {
+                                ui.selectable_value(&mut font_family, family.clone(), family);
+                            }
+                        });
+                    combo.response.on_hover_text("重新启动后生效");
+                    if font_family != self.config.ssh_terminal.font_family {
+                        self.config.ssh_terminal.font_family = font_family;
+                        *config_changed = true;
+                    }
+                    ui.end_row();
+
                     settings_row_label(ui, "字体大小");
                     let mut font_size = self.config.ssh_terminal.font_size;
                     egui::ComboBox::from_id_salt("ssh_terminal_font_size")
@@ -460,6 +494,134 @@ impl RShellApp {
         self.show_settings_error(ui);
     }
 
+    fn show_transfer_settings_page(&mut self, ui: &mut Ui, config_changed: &mut bool) {
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            ui.label(RichText::new("下载").strong().size(14.0));
+            ui.add_space(9.0);
+
+            egui::Grid::new("transfer_settings_grid")
+                .num_columns(2)
+                .spacing([32.0, 14.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, "下载路径");
+                    let mut mode = self.config.transfers.download_mode;
+                    egui::ComboBox::from_id_salt("download_path_mode")
+                        .selected_text(mode.label())
+                        .width(190.0)
+                        .show_ui(ui, |ui| {
+                            for option in [
+                                DownloadPathMode::AskEachTime,
+                                DownloadPathMode::FixedDirectory,
+                            ] {
+                                ui.selectable_value(&mut mode, option, option.label());
+                            }
+                        });
+                    if mode != self.config.transfers.download_mode {
+                        self.config.transfers.download_mode = mode;
+                        *config_changed = true;
+                    }
+                    ui.end_row();
+
+                    if mode == DownloadPathMode::FixedDirectory {
+                        settings_row_label(ui, "保存目录");
+                        if ui.button("选择目录…").clicked()
+                            && let Some(path) = rfd::FileDialog::new().pick_folder()
+                        {
+                            self.config.transfers.download_dir =
+                                path.to_string_lossy().into_owned();
+                            *config_changed = true;
+                        }
+                        ui.end_row();
+                    }
+                });
+
+            if self.config.transfers.download_mode == DownloadPathMode::FixedDirectory {
+                ui.add_space(7.0);
+                let dir = self.config.transfers.download_dir.trim();
+                if dir.is_empty() {
+                    ui.label(
+                        RichText::new("尚未选择目录，下载时将回退为每次询问")
+                            .color(Color32::from_rgb(0xD9, 0x78, 0x32))
+                            .small(),
+                    );
+                } else {
+                    ui.label(RichText::new(dir).weak()).on_hover_text(dir);
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("同名文件将被直接覆盖；目录已删除时回退为每次询问")
+                            .weak()
+                            .small(),
+                    );
+                }
+            }
+        });
+
+        ui.add_space(10.0);
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            ui.label(RichText::new("文件打开方式").strong().size(14.0));
+            ui.add_space(9.0);
+
+            egui::Grid::new("file_open_settings_grid")
+                .num_columns(2)
+                .spacing([32.0, 14.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, "打开程序");
+                    let mut mode = self.config.transfers.open_mode;
+                    egui::ComboBox::from_id_salt("file_open_mode")
+                        .selected_text(mode.label())
+                        .width(190.0)
+                        .show_ui(ui, |ui| {
+                            for option in [
+                                FileOpenMode::SystemDefault,
+                                FileOpenMode::CustomProgram,
+                            ] {
+                                ui.selectable_value(&mut mode, option, option.label());
+                            }
+                        });
+                    if mode != self.config.transfers.open_mode {
+                        self.config.transfers.open_mode = mode;
+                        *config_changed = true;
+                    }
+                    ui.end_row();
+
+                    if mode == FileOpenMode::CustomProgram {
+                        settings_row_label(ui, "程序路径");
+                        if ui.button("选择程序…").clicked()
+                            && let Some(path) = rfd::FileDialog::new().pick_file()
+                        {
+                            self.config.transfers.open_program =
+                                path.to_string_lossy().into_owned();
+                            *config_changed = true;
+                        }
+                        ui.end_row();
+                    }
+                });
+
+            ui.add_space(7.0);
+            if self.config.transfers.open_mode == FileOpenMode::CustomProgram {
+                let program = self.config.transfers.open_program.trim();
+                if program.is_empty() {
+                    ui.label(
+                        RichText::new("尚未选择程序，打开时将回退为系统默认")
+                            .color(Color32::from_rgb(0xD9, 0x78, 0x32))
+                            .small(),
+                    );
+                } else {
+                    ui.label(RichText::new(program).weak()).on_hover_text(program);
+                }
+            }
+            ui.label(
+                RichText::new("用于文件管理器的\"用本地程序打开\"；远程文件会先下载到临时目录，保存后自动传回")
+                    .weak()
+                    .small(),
+            );
+        });
+
+        self.show_settings_error(ui);
+    }
+
     fn show_security_settings_page(&mut self, ui: &mut Ui) {
         settings_section_frame(ui).show(ui, |ui| {
             ui.set_width(396.0);
@@ -536,6 +698,36 @@ impl RShellApp {
             ui.add_space(10.0);
             ui.colored_label(Color32::from_rgb(0xE8, 0x4C, 0x3D), error);
         }
+    }
+
+    fn show_editor_settings_page(&mut self, ui: &mut Ui, config_changed: &mut bool) {
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            egui::Grid::new("editor_settings_grid")
+                .num_columns(2)
+                .spacing([32.0, 14.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, "记住打开的文件");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if settings_toggle(ui, &mut self.config.editor.remember_open_files)
+                            .changed()
+                        {
+                            *config_changed = true;
+                        }
+                    });
+                    ui.end_row();
+
+                    settings_row_label(ui, "自动换行");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if settings_toggle(ui, &mut self.config.editor.auto_wrap).changed() {
+                            *config_changed = true;
+                        }
+                    });
+                    ui.end_row();
+                });
+        });
+
+        self.show_settings_error(ui);
     }
 
     fn change_password_storage(&mut self, from: PasswordStorage, to: PasswordStorage) {
@@ -712,7 +904,8 @@ pub(crate) fn apply_native_window_theme(ctx: &egui::Context, theme: ThemeMode) {
 
 pub(crate) fn apply_color_scheme(ctx: &egui::Context, scheme: ColorScheme) {
     let color = match scheme {
-        ColorScheme::Blue => Color32::from_rgb(0x3C, 0x82, 0xE8),
+        // 使用更浅、更亮的蓝色，降低它与深色界面背景之间的反差。
+        ColorScheme::Blue => Color32::from_rgb(0x6E, 0xA4, 0xE5),
         ColorScheme::Green => Color32::from_rgb(0x35, 0xA8, 0x67),
         ColorScheme::Purple => Color32::from_rgb(0x8A, 0x63, 0xD2),
         ColorScheme::Orange => Color32::from_rgb(0xD9, 0x78, 0x32),

@@ -16,12 +16,10 @@ pub enum SessionCmd {
 
 /// 会话 → UI 的事件
 pub enum SessionEvent {
-    /// 远端/子进程输出的原始字节
-    Data(Vec<u8>),
     /// 会话进程退出或连接断开
     Exited,
     /// 一轮系统监控指标
-    Metrics(Box<monitor::SystemMetrics>),
+    Metrics(std::sync::Arc<monitor::SystemMetrics>),
     /// 文件服务(SFTP/本机文件)事件
     Sftp(files::SftpEvent),
     /// 主机指纹需要用户确认(首次连接或指纹变更)
@@ -53,9 +51,35 @@ pub fn cmd_channel() -> (CmdTx, CmdRx) {
     tokio::sync::mpsc::unbounded_channel()
 }
 
+/// 终端输出使用有界通道；每块不超过 64 KiB 时，最多积压约 16 MiB。
+pub type DataTx = tokio::sync::mpsc::Sender<Vec<u8>>;
+pub type DataRx = tokio::sync::mpsc::Receiver<Vec<u8>>;
+
+pub fn data_channel() -> (DataTx, DataRx) {
+    tokio::sync::mpsc::channel(256)
+}
+
 /// 一个会话对外暴露的全部通道
 pub struct SessionChannels {
     pub cmd_tx: CmdTx,
+    pub data_rx: DataRx,
     pub event_rx: std::sync::mpsc::Receiver<SessionEvent>,
     pub sftp_tx: files::SftpTx,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_data_channel_has_hard_capacity() {
+        let (tx, _rx) = data_channel();
+        for _ in 0..256 {
+            tx.try_send(vec![0; 64 * 1024]).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(vec![0]),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+    }
 }

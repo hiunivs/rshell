@@ -2,6 +2,12 @@ use crate::app::{MonitorView, ProcSort, RShellApp};
 use crate::session::monitor::SystemMetrics;
 use egui::{Color32, Pos2, RichText, Stroke, vec2};
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+fn debug_resize_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var_os("RSHELL_DEBUG_RESIZE").is_some())
+}
 
 /// 侧栏宽度范围(Panel::left 的 size_range 与覆盖条 clamp 共用)。
 /// 下限必须 ≥ 内容最小宽(约 164:usage_row 32+66+20+间距 16,加分区框
@@ -38,30 +44,46 @@ impl RShellApp {
                     .show(ui, |ui| {
                         // 先取快照,避免边栏绘制时与 self 借用冲突。
                         // SysInfo 标签页时显示源会话的数据
-                        let (host, monitor) = match self.effective_session() {
-                            Some(s) => (s.host.clone(), s.monitor.clone()),
-                            None => ("—".to_string(), MonitorView::default()),
+                        let (host, metrics, top_mem, top_cpu) = match self.effective_session() {
+                            Some(s) => (
+                                s.host.clone(),
+                                s.monitor.metrics.clone(),
+                                Arc::clone(&s.monitor.top_mem),
+                                Arc::clone(&s.monitor.top_cpu),
+                            ),
+                            None => (
+                                "—".to_string(),
+                                None,
+                                Arc::new(Vec::new()),
+                                Arc::new(Vec::new()),
+                            ),
                         };
-                        let has_data = monitor.metrics.is_some();
+                        let has_data = metrics.is_some();
 
                         // 每个分区套一个圆角包围框,模块边界一眼可辨
                         framed_section(ui, |ui| sidebar_status(ui, &host, has_data));
                         framed_section(ui, |ui| {
-                            if sidebar_sysinfo(ui, monitor.metrics.as_ref()) {
+                            if sidebar_sysinfo(ui, metrics.as_deref()) {
                                 open_sysinfo = true;
                             }
                         });
                         framed_section(ui, |ui| {
-                            sidebar_processes(ui, monitor.metrics.as_ref(), &mut self.proc_sort)
+                            sidebar_processes(
+                                ui,
+                                metrics.as_deref(),
+                                &top_mem,
+                                &top_cpu,
+                                &mut self.proc_sort,
+                            )
                         });
                         // 网络卡片需要改选中网卡,直接操作会话的 monitor(不走快照)
                         framed_section(ui, |ui| match self.effective_session_idx() {
                             Some(idx) => sidebar_network(ui, &mut self.sessions[idx].monitor),
                             None => sidebar_network(ui, &mut MonitorView::default()),
                         });
-                        framed_section(ui, |ui| sidebar_disks(ui, monitor.metrics.as_ref()));
+                        framed_section(ui, |ui| sidebar_disks(ui, metrics.as_deref()));
                     });
-                if std::env::var_os("RSHELL_DEBUG_RESIZE").is_some() {
+                if debug_resize_enabled() {
                     eprintln!(
                         "scrollarea: id={} inner_rect={:?} content_size={:?}",
                         out.id.short_debug_format(),
@@ -215,6 +237,18 @@ fn pct(used: u64, total: u64) -> f32 {
     }
 }
 
+/// 系统资源占用率颜色：低于 70% 正常，70% 起警告，90% 起危险。
+/// CPU、物理内存和交换空间共用，避免百分比与颜色表达相互矛盾。
+fn usage_color(frac: f32) -> Color32 {
+    if frac >= 0.9 {
+        Color32::from_rgb(0xE8, 0x4C, 0x3D)
+    } else if frac >= 0.7 {
+        Color32::from_rgb(0xF1, 0xA6, 0x3C)
+    } else {
+        Color32::from_rgb(0x4C, 0xAF, 0x50)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 各分区
 // ---------------------------------------------------------------------------
@@ -234,11 +268,46 @@ fn sidebar_status(ui: &mut egui::Ui, host: &str, has_data: bool) {
         // 主机名可能很长,截断显示以免撑高内容最小宽
         ui.add(egui::Label::new(RichText::new(host).strong()).truncate());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("复制").clicked() {
+            if sidebar_copy_button(ui).clicked() {
                 ui.ctx().copy_text(host.to_string());
             }
         });
     });
+}
+
+/// 固定几何尺寸的侧栏复制按钮。
+///
+/// 标准 `small_button` 会根据上一帧的 hover 状态选取不同的 Frame 样式；
+/// 在紧贴自适应卡片底部时，状态边距可能反向撑大父布局。这里把交互态只用于
+/// 颜色，描边始终画在固定矩形内部，避免同步状态卡片悬停时改变高度。
+fn sidebar_copy_button(ui: &mut egui::Ui) -> egui::Response {
+    let text = "复制";
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text_size = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), font.clone(), ui.visuals().text_color())
+            .size()
+    });
+    let size = vec2((text_size.x + 10.0).ceil(), text_size.y.ceil() + 2.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(3),
+        visuals.weak_bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        font,
+        visuals.fg_stroke.color,
+    );
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("复制 IP 地址")
 }
 
 /// 系统信息:运行时间、负载、CPU/内存/交换。
@@ -284,14 +353,7 @@ fn sidebar_sysinfo(ui: &mut egui::Ui, m: Option<&SystemMetrics>) -> bool {
         .max(measure(&swap_text));
 
     let cpu = m.map(|mm| mm.cpu_percent / 100.0).unwrap_or(0.0);
-    usage_row(
-        ui,
-        "CPU",
-        cpu,
-        cpu_text,
-        Color32::from_rgb(0x4C, 0xAF, 0x50),
-        text_w,
-    );
+    usage_row(ui, "CPU", cpu, cpu_text, usage_color(cpu), text_w);
     let mem_frac = m
         .map(|mm| pct(mm.mem_used_kb, mm.mem_total_kb))
         .unwrap_or(0.0);
@@ -300,7 +362,7 @@ fn sidebar_sysinfo(ui: &mut egui::Ui, m: Option<&SystemMetrics>) -> bool {
         "内存",
         mem_frac,
         mem_text,
-        Color32::from_rgb(0xF1, 0xA6, 0x3C),
+        usage_color(mem_frac),
         text_w,
     );
     let swap_frac = m
@@ -311,7 +373,7 @@ fn sidebar_sysinfo(ui: &mut egui::Ui, m: Option<&SystemMetrics>) -> bool {
         "交换",
         swap_frac,
         swap_text,
-        Color32::from_rgb(0x4C, 0xAF, 0x50),
+        usage_color(swap_frac),
         text_w,
     );
     open_detail
@@ -326,21 +388,30 @@ fn usage_row(ui: &mut egui::Ui, label: &str, frac: f32, text: String, color: Col
         let avail = ui.available_width();
         let label_w = 32.0;
         let spacing = ui.spacing().item_spacing.x;
+        // 百分比使用 TextStyle::Button，区域高度跟随内置字体的真实行高。
+        let row_h = ui
+            .text_style_height(&egui::TextStyle::Body)
+            .max(ui.text_style_height(&egui::TextStyle::Button))
+            .ceil();
+        // 保留文字所在行的高度，只缩细进度条并由 horizontal 布局垂直居中。
+        // 直接压缩整行会再次造成百分比文字上下偏移。
+        let bar_h = row_h * (2.0 / 3.0);
         // 侧栏过窄时:先保 bar 下限 20,文本按可用截断
         let text_w = text_w.min((avail - label_w - 20.0 - 2.0 * spacing).max(0.0));
         let bar_w = (avail - label_w - text_w - 2.0 * spacing).max(20.0);
-        ui.add_sized([label_w, 14.0], egui::Label::new(label));
+        ui.add_sized([label_w, row_h], egui::Label::new(label));
         let bar = egui::ProgressBar::new(frac)
             .fill(color)
             .show_percentage()
             .desired_width(bar_w)
-            .desired_height(12.0);
+            .desired_height(bar_h);
         ui.add(bar);
-        ui.add_sized([text_w, 14.0], egui::Label::new(text).truncate());
+        ui.add_sized([text_w, row_h], egui::Label::new(text).truncate());
     });
 }
 
 /// 按排序键取前 10(采集层给的是全量进程,排序/截断都在这里做)
+#[cfg(test)]
 pub fn top_procs(m: &SystemMetrics, sort: ProcSort) -> Vec<&crate::session::monitor::ProcInfo> {
     let mut procs: Vec<_> = m.procs.iter().collect();
     match sort {
@@ -359,7 +430,13 @@ pub fn top_procs(m: &SystemMetrics, sort: ProcSort) -> Vec<&crate::session::moni
 /// 保证内容最小宽低于 SIDEBAR_W_MIN。
 /// 点击"内存"/"CPU"表头切换排序键,选中列高亮;始终显示该键的前 10 名
 /// (采集层给的是全量进程,高 CPU 低内存的进程不会被内存截断漏掉)
-fn sidebar_processes(ui: &mut egui::Ui, m: Option<&SystemMetrics>, sort: &mut ProcSort) {
+fn sidebar_processes(
+    ui: &mut egui::Ui,
+    m: Option<&SystemMetrics>,
+    top_mem: &[crate::session::monitor::ProcInfo],
+    top_cpu: &[crate::session::monitor::ProcInfo],
+    sort: &mut ProcSort,
+) {
     let spacing = ui.spacing().item_spacing.x;
     let cmd_w = (ui.available_width() - 56.0 - 36.0 - 2.0 * spacing).max(20.0);
     ui.horizontal(|ui| {
@@ -412,15 +489,23 @@ fn sidebar_processes(ui: &mut egui::Ui, m: Option<&SystemMetrics>, sort: &mut Pr
     });
     match m {
         Some(m) if !m.procs.is_empty() => {
-            for p in top_procs(m, *sort) {
+            let procs = match sort {
+                ProcSort::Mem => top_mem,
+                ProcSort::Cpu => top_cpu,
+            };
+            for p in procs {
                 ui.horizontal(|ui| {
-                    ui.add_sized([56.0, 14.0], egui::Label::new(fmt_kb(p.rss_kb)));
+                    let row_h = ui
+                        .text_style_height(&egui::TextStyle::Body)
+                        .ceil()
+                        .max(14.0);
+                    ui.add_sized([56.0, row_h], egui::Label::new(fmt_kb(p.rss_kb)));
                     ui.add_sized(
-                        [36.0, 14.0],
+                        [36.0, row_h],
                         // 一位小数:0.3% 这类波动也能看到,整数会常年显示 0
                         egui::Label::new(format!("{:.1}", p.cpu)),
                     );
-                    ui.add_sized([cmd_w, 14.0], egui::Label::new(&p.command).truncate());
+                    ui.add_sized([cmd_w, row_h], egui::Label::new(&p.command).truncate());
                 });
             }
         }
@@ -479,14 +564,13 @@ fn sidebar_network(ui: &mut egui::Ui, monitor: &mut MonitorView) {
     // 双折线图:rx 绿 / tx 红,共用一个最大值做缩放
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), egui::Sense::hover());
     let p = ui.painter_at(rect);
-    p.rect_filled(rect, 0.0, Color32::from_rgb(0xF5, 0xF5, 0xF0));
+    // 背景和辅助线跟随当前主题；原先写死的浅色会在深色主题下形成白块。
+    let chart_bg = ui.visuals().extreme_bg_color;
+    let grid_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    p.rect_filled(rect, 2.0, chart_bg);
     for frac in [0.25, 0.5, 0.75] {
         let y = rect.top() + rect.height() * frac;
-        p.hline(
-            rect.left()..=rect.right(),
-            y,
-            Stroke::new(1.0, Color32::from_rgb(0xE0, 0xE0, 0xD8)),
-        );
+        p.hline(rect.left()..=rect.right(), y, Stroke::new(1.0, grid_color));
     }
     // 折线图数据源:选中网卡的历史,未选则用聚合历史
     let empty_hist = VecDeque::new();
@@ -666,5 +750,15 @@ mod tests {
         );
         assert_eq!(top_procs(&m, ProcSort::Mem).len(), 10);
         assert_eq!(top_procs(&m, ProcSort::Cpu).len(), 10);
+    }
+
+    #[test]
+    fn resource_usage_color_tracks_thresholds() {
+        assert_eq!(usage_color(0.0), Color32::from_rgb(0x4C, 0xAF, 0x50));
+        assert_eq!(usage_color(0.69), Color32::from_rgb(0x4C, 0xAF, 0x50));
+        assert_eq!(usage_color(0.70), Color32::from_rgb(0xF1, 0xA6, 0x3C));
+        assert_eq!(usage_color(0.89), Color32::from_rgb(0xF1, 0xA6, 0x3C));
+        assert_eq!(usage_color(0.90), Color32::from_rgb(0xE8, 0x4C, 0x3D));
+        assert_eq!(usage_color(1.0), Color32::from_rgb(0xE8, 0x4C, 0x3D));
     }
 }

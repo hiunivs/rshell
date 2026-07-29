@@ -17,17 +17,18 @@ impl RShellApp {
         ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(0x1A, 0x1A, 0x1A));
 
         // SysInfo 标签:数据来自源会话的监控快照
-        let Some(monitor) = self.effective_session().map(|s| s.monitor.clone()) else {
+        let Some(session) = self.effective_session() else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("源会话已关闭").weak());
             });
             return;
         };
+        let metrics = session.monitor.metrics.clone();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_space(10.0);
-                match monitor.metrics.as_ref() {
+                match metrics.as_deref() {
                     Some(m) => sysinfo_detail(ui, m),
                     None => {
                         ui.add_space(20.0);
@@ -191,7 +192,7 @@ fn sysinfo_detail(ui: &mut egui::Ui, m: &SystemMetrics) {
 /// 行首标签 + 内容的通用行;内容区是竖向布局(表头在上、数据行在下)
 fn section_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal_top(|ui| {
-        ui.add_sized([LABEL_W, 18.0], egui::Label::new(label));
+        ui.add_sized([LABEL_W, body_row_height(ui)], egui::Label::new(label));
         ui.vertical(add);
     });
 }
@@ -221,20 +222,26 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
 /// 表头:弱化文本,定宽列(第一列更宽)
 fn table_header(ui: &mut egui::Ui, cols: &[&str]) {
     ui.horizontal(|ui| {
+        let row_h = body_row_height(ui);
         for (i, c) in cols.iter().enumerate() {
             let w = if i == 0 { 200.0 } else { 90.0 };
-            ui.add_sized([w, 16.0], egui::Label::new(RichText::new(*c).weak()));
+            ui.add_sized([w, row_h], egui::Label::new(RichText::new(*c).weak()));
         }
     });
 }
 
 fn table_row<S: AsRef<str>>(ui: &mut egui::Ui, cols: &[S]) {
     ui.horizontal(|ui| {
+        let row_h = body_row_height(ui);
         for (i, c) in cols.iter().enumerate() {
             let w = if i == 0 { 200.0 } else { 90.0 };
-            ui.add_sized([w, 16.0], egui::Label::new(c.as_ref()).truncate());
+            ui.add_sized([w, row_h], egui::Label::new(c.as_ref()).truncate());
         }
     });
+}
+
+fn body_row_height(ui: &egui::Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Body).ceil()
 }
 
 fn or_dash(s: &str) -> &str {
@@ -281,6 +288,7 @@ fn memory_columns<S: AsRef<str>>(ui: &mut egui::Ui, values: &[S; 5], header: boo
     let name_width = 68.0;
     let value_width = ((ui.available_width() - name_width - spacing * 4.0) / 4.0).max(48.0);
     ui.horizontal(|ui| {
+        let row_h = body_row_height(ui);
         for (index, value) in values.iter().enumerate() {
             let text = if header && index > 0 {
                 RichText::new(value.as_ref()).weak()
@@ -290,7 +298,7 @@ fn memory_columns<S: AsRef<str>>(ui: &mut egui::Ui, values: &[S; 5], header: boo
                 RichText::new(value.as_ref())
             };
             let width = if index == 0 { name_width } else { value_width };
-            ui.add_sized([width, 16.0], egui::Label::new(text));
+            ui.add_sized([width, row_h], egui::Label::new(text));
         }
     });
 }

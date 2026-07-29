@@ -1,5 +1,6 @@
 use crate::app::RShellApp;
 use crate::config::{AppConfig, SavedConnection};
+use crate::ui::icons::Icon;
 use egui::{Color32, RichText};
 
 impl RShellApp {
@@ -8,7 +9,8 @@ impl RShellApp {
         let mut connect: Option<String> = None;
         let mut edit: Option<String> = None;
         let mut open_local = false;
-        let connections = self.config.connections.clone();
+        let mut open_library = false;
+        let connections = &self.config.connections;
         let error = self
             .sessions
             .get(self.active)
@@ -25,11 +27,29 @@ impl RShellApp {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // right_to_left：先添加的按钮位于最右侧。
-                        if ui.button("新建本机终端").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::image_and_text(
+                                    Icon::SquareTerminal.image(14.0, Color32::WHITE),
+                                    "新建本机终端",
+                                )
+                                .image_tint_follows_text_color(true),
+                            )
+                            .clicked()
+                        {
                             open_local = true;
                         }
-                        if ui.button("打开连接库").clicked() {
-                            self.show_library = true;
+                        if ui
+                            .add(
+                                egui::Button::image_and_text(
+                                    Icon::BookOpen.image(14.0, Color32::WHITE),
+                                    "打开连接库",
+                                )
+                                .image_tint_follows_text_color(true),
+                            )
+                            .clicked()
+                        {
+                            open_library = true;
                         }
                     });
                 });
@@ -97,6 +117,9 @@ impl RShellApp {
                     });
             });
 
+        if open_library {
+            self.show_library = true;
+        }
         if open_local {
             self.open_local(ui.ctx());
             return;

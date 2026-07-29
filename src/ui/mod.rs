@@ -1,8 +1,10 @@
 pub mod conn_library;
 pub mod connect_dialog;
 pub mod dialog;
+pub mod file_editor;
 pub mod file_manager;
 pub mod hostkey_dialog;
+pub mod icons;
 pub mod launcher;
 pub mod settings;
 pub mod sidebar;

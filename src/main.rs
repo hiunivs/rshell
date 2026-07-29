@@ -2,9 +2,12 @@ mod app;
 mod app_render_test;
 mod config;
 mod export;
+mod file_kind;
 mod file_manager;
 mod keys;
 mod known_hosts;
+#[cfg(target_os = "macos")]
+mod macos_dock;
 mod panel_drag_test;
 
 mod secrets;
@@ -33,6 +36,7 @@ fn main() -> eframe::Result<()> {
         "RShell",
         options,
         Box::new(move |cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             // debug 构建下 egui 默认开启两项调试绘制,都会产生"红框"假象:
             // - show_unaligned:小数坐标的 Ui 矩形画橙框+"Unaligned"字样
             // - warn_if_rect_changes_id:同一矩形上的控件 id 逐帧变化时画纯红 2px 框
@@ -124,106 +128,127 @@ impl egui::Plugin for RedFramePlugin {
     }
 }
 
-/// 加载系统 CJK 字体作为回退,保证中文 UI 与终端中文输出正常显示。
-pub(crate) fn install_cjk_fonts(ctx: &egui::Context) {
+/// 安装内置 UI 字体和用户选择的终端等宽字体。
+/// 结果全局缓存(OnceLock),字体字节只保留一份并存活到进程退出。
+pub(crate) fn install_app_fonts(ctx: &egui::Context, terminal_font_family: &str) {
+    let resources =
+        FONT_RESOURCES.get_or_init(|| build_font_resources(terminal_font_family.trim()));
+    ctx.set_fonts(resources.definitions.clone());
+}
+
+/// 设置页可选择的系统等宽字体。字体数据库在启动安装字体时已完成扫描，
+/// 打开设置页不会再次扫描磁盘。
+pub(crate) fn terminal_font_families() -> &'static [String] {
+    FONT_RESOURCES
+        .get()
+        .map(|resources| resources.terminal_families.as_slice())
+        .unwrap_or(&[])
+}
+
+const TERMINAL_FONT_FAMILY: &str = "rshell_terminal";
+const UI_FONT_NAME: &str = "rshell_ui";
+const UI_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/RShellUI-Regular.otf");
+
+/// 终端及内建编辑器共用的字体 ID，确保两处始终使用相同主字体和回退链。
+pub(crate) fn terminal_font_id(size: f32) -> egui::FontId {
+    static FAMILY: std::sync::OnceLock<egui::FontFamily> = std::sync::OnceLock::new();
+    let family = FAMILY
+        .get_or_init(|| egui::FontFamily::Name(TERMINAL_FONT_FAMILY.into()))
+        .clone();
+    egui::FontId::new(size.clamp(8.0, 32.0), family)
+}
+
+struct FontResources {
+    definitions: egui::FontDefinitions,
+    terminal_families: Vec<String>,
+}
+
+static FONT_RESOURCES: std::sync::OnceLock<FontResources> = std::sync::OnceLock::new();
+
+fn build_font_resources(terminal_font_family: &str) -> FontResources {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
 
-    // 按平台常见程度排序的候选中文字体
-    const CANDIDATES: &[&str] = &[
-        "PingFang SC",         // macOS
-        "Hiragino Sans GB",    // macOS 备选
-        "Microsoft YaHei",     // Windows
-        "Noto Sans CJK SC",    // Linux
-        "WenQuanYi Micro Hei", // Linux 备选
-        "SimHei",              // Windows 备选
-    ];
+    let mut terminal_families = std::collections::BTreeSet::new();
+    for face in db
+        .faces()
+        .filter(|face| face.monospaced && face.style == fontdb::Style::Normal)
+    {
+        if let Some((family, _)) = face.families.first() {
+            terminal_families.insert(family.clone());
+        }
+    }
+    terminal_families.remove("Hack");
+    let terminal_families = std::iter::once("Hack".to_owned())
+        .chain(terminal_families)
+        .collect::<Vec<_>>();
 
     let mut fonts = egui::FontDefinitions::default();
-    let mut loaded = false;
-    for family in CANDIDATES {
+    // 内置 Noto Sans SC 同时覆盖中英文，使用字体原始度量。不要再叠加过去
+    // 为系统字体回退差异准备的缩放或基线偏移，否则会让字形变小、视觉上移。
+    let ui_font = egui::FontData::from_static(UI_FONT_BYTES);
+    fonts
+        .font_data
+        .insert(UI_FONT_NAME.to_owned(), std::sync::Arc::new(ui_font));
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        // UI 中英文和常用符号统一使用内置字体，不再受操作系统字体影响。
+        .insert(0, UI_FONT_NAME.to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        // 终端保持等宽主字体，只把内置字体作为 CJK 回退。
+        .push(UI_FONT_NAME.to_owned());
+
+    // 终端使用独立命名字体族，不改变普通 UI 和内建编辑器的字体。
+    // 只加载用户当前选中的一个系统等宽字体；不存在或不是等宽字体时回退 Hack。
+    let mut terminal_primary = "Hack".to_owned();
+    if !terminal_font_family.is_empty() && terminal_font_family != "Hack" {
         let query = fontdb::Query {
-            families: &[fontdb::Family::Name(family)],
+            families: &[fontdb::Family::Name(terminal_font_family)],
             ..Default::default()
         };
-        let Some(id) = db.query(&query) else {
-            continue;
-        };
-        let Some((source, index)) = db.face_source(id) else {
-            continue;
-        };
-        let bytes = match &source {
-            fontdb::Source::File(path) => std::fs::read(path).ok(),
-            fontdb::Source::Binary(data) => Some(data.as_ref().as_ref().to_vec()),
-            fontdb::Source::SharedFile(_, data) => Some(data.as_ref().as_ref().to_vec()),
-        };
-        let Some(bytes) = bytes else { continue };
-
-        let mut data = egui::FontData::from_owned(bytes);
-        data.index = index;
-        fonts
-            .font_data
-            .insert("cjk".to_owned(), std::sync::Arc::new(data));
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .push("cjk".to_owned());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("cjk".to_owned());
-        loaded = true;
-        break;
+        if let Some(id) = db.query(&query)
+            && db.face(id).is_some_and(|face| face.monospaced)
+            && let Some((source, index)) = db.face_source(id)
+            && let Some(data) = load_font_data(&source, index)
+        {
+            fonts
+                .font_data
+                .insert("terminal_custom".to_owned(), std::sync::Arc::new(data));
+            terminal_primary = "terminal_custom".to_owned();
+        }
     }
 
-    // UI 符号字体回退。默认字体与 CJK 字体都不保证覆盖 ⌂、三角等符号。
-    const SYMBOL_CANDIDATES: &[&str] = &[
-        "Apple Symbols",       // macOS
-        "Segoe UI Symbol",     // Windows
-        "Noto Sans Symbols 2", // Linux
-        "DejaVu Sans",         // Linux 备选
-        "Arial Unicode MS",    // macOS 备选
-    ];
-    for family in SYMBOL_CANDIDATES {
-        let query = fontdb::Query {
-            families: &[fontdb::Family::Name(family)],
-            ..Default::default()
-        };
-        let Some(id) = db.query(&query) else {
-            continue;
-        };
-        let Some((source, index)) = db.face_source(id) else {
-            continue;
-        };
-        let bytes = match &source {
-            fontdb::Source::File(path) => std::fs::read(path).ok(),
-            fontdb::Source::Binary(data) => Some(data.as_ref().as_ref().to_vec()),
-            fontdb::Source::SharedFile(_, data) => Some(data.as_ref().as_ref().to_vec()),
-        };
-        let Some(bytes) = bytes else { continue };
+    let mut terminal_chain = vec![terminal_primary];
+    terminal_chain.push(UI_FONT_NAME.to_owned());
+    fonts.families.insert(
+        egui::FontFamily::Name(TERMINAL_FONT_FAMILY.into()),
+        terminal_chain,
+    );
 
-        let mut data = egui::FontData::from_owned(bytes);
-        data.index = index;
-        fonts
-            .font_data
-            .insert("symbols".to_owned(), std::sync::Arc::new(data));
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .push("symbols".to_owned());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push("symbols".to_owned());
-        loaded = true;
-        break;
+    FontResources {
+        definitions: fonts,
+        terminal_families,
     }
+}
 
-    if loaded {
-        ctx.set_fonts(fonts);
-    }
+/// egui 0.35 会在构造字体 Blob 时克隆 owned 字节。将系统字体固定为进程级
+/// borrowed 数据，可避免大型 TTC 在 `FontDefinitions` 和字体 Blob 中各保留一份。
+///
+/// 此函数只会在全局 `FONT_RESOURCES` 首次初始化时调用，泄漏的缓冲区数量固定，并在
+/// 进程退出时由操作系统回收；它不会随窗口或 viewport 数量增长。
+fn load_font_data(source: &fontdb::Source, index: u32) -> Option<egui::FontData> {
+    let bytes = match source {
+        fontdb::Source::File(path) => std::fs::read(path).ok()?,
+        fontdb::Source::Binary(data) => data.as_ref().as_ref().to_vec(),
+        fontdb::Source::SharedFile(_, data) => data.as_ref().as_ref().to_vec(),
+    };
+    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+    let mut data = egui::FontData::from_static(bytes);
+    data.index = index;
+    Some(data)
 }

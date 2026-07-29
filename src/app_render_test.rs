@@ -77,8 +77,8 @@ mod tests {
             let app: &mut RShellApp = harness.state_mut();
             app.open_local(&egui::Context::default());
             app.open_local(&egui::Context::default());
-            app.sessions[0].title = "1 root@150.158.140.133".into();
-            app.sessions[1].title = "2 本机".into();
+            app.sessions[0].title = "root@阿里云-MeleFe".into();
+            app.sessions[1].title = "root@测试机".into();
             app.active = 0;
         }
         harness.run_steps(3);
@@ -87,7 +87,7 @@ mod tests {
         eprintln!("saved /tmp/rshell_tabs.png");
     }
 
-    /// 查候选图标字形在 app 字体下是否有覆盖(has_glyph,程序化精确判断)
+    /// 验证内置 UI 字体和终端字体链的基本覆盖与原始行高度量。
     #[test]
     fn glyph_coverage() {
         let mut harness = egui_kittest::Harness::new_ui_state(
@@ -96,84 +96,52 @@ mod tests {
             },
             (),
         );
-        crate::install_cjk_fonts(&harness.ctx);
+        crate::install_app_fonts(&harness.ctx, "Hack");
         harness.run_steps(1);
-        let mut report = String::new();
-        for s in [
-            "↑",
-            "↓",
-            "⟳",
-            "⟲",
-            "⇪",
-            "⇩",
-            "⇧",
-            "↻",
-            "▸",
-            "▾",
-            "▲",
-            "▼",
-            "▶",
-            "►",
-            "●",
-            "○",
-            "•",
-            "✓",
-            "✗",
-            "⚙",
-            "⎘",
-            "⧉",
-            "\u{2302}",
-            "\u{1F3E0}",
-        ] {
-            let c = s.chars().next().unwrap();
-            let has = harness
-                .ctx
-                .fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), c));
-            report.push_str(&format!("  {c}  has_glyph={has}\n"));
-        }
-        eprintln!("glyph coverage:\n{report}");
-        // 工具栏和树控件使用的字形必须由默认/CJK/符号字体回退链覆盖。
+        assert!(
+            crate::terminal_font_families()
+                .iter()
+                .any(|family| family == "Hack"),
+            "终端字体列表必须始终包含内置 Hack"
+        );
+        let terminal_font =
+            egui::FontId::new(13.0, egui::FontFamily::Name("rshell_terminal".into()));
+        // epaint 0.35 的 `has_glyph` 会在字符和替代字符由同一个字体
+        // 提供时误报 false；检查实际字宽才能覆盖真实的布局路径。
         assert!(
             harness
                 .ctx
-                .fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), '⇧')),
-            "⇧ 必须有覆盖"
+                .fonts_mut(|fonts| fonts.glyph_width(&terminal_font, 'M'))
+                > 0.0,
+            "终端字体族必须覆盖 ASCII"
         );
         assert!(
             harness
                 .ctx
-                .fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), '⇩')),
-            "⇩ 必须有覆盖"
+                .fonts_mut(|fonts| fonts.glyph_width(&terminal_font, '中'))
+                > 0.0,
+            "终端字体族必须保留 CJK 回退"
+        );
+        let body_font = egui::FontId::proportional(13.0);
+        assert!(
+            harness
+                .ctx
+                .fonts_mut(|fonts| fonts.glyph_width(&body_font, 'R'))
+                > 0.0,
+            "内置 UI 字体必须覆盖拉丁字符"
         );
         assert!(
             harness
                 .ctx
-                .fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), '▲')),
-            "▲ 必须有覆盖"
+                .fonts_mut(|fonts| fonts.glyph_width(&body_font, '中'))
+                > 0.0,
+            "内置 UI 字体必须覆盖中文"
         );
+
+        let body_row_height = harness.ctx.fonts_mut(|fonts| fonts.row_height(&body_font));
         assert!(
-            harness
-                .ctx
-                .fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), '▼')),
-            "▼ 必须有覆盖"
-        );
-        assert!(
-            harness
-                .ctx
-                .fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), '⌂')),
-            "⌂ 必须由符号字体覆盖"
-        );
-        assert!(
-            harness
-                .ctx
-                .fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), '▸')),
-            "▸ 必须由符号字体覆盖"
-        );
-        assert!(
-            harness
-                .ctx
-                .fonts_mut(|f| f.has_glyph(&egui::FontId::proportional(14.0), '▾')),
-            "▾ 必须由符号字体覆盖"
+            (18.0..=20.0).contains(&body_row_height),
+            "内置 UI 字体 13px 应使用未缩放的原始行高，实际为 {body_row_height}"
         );
     }
     #[test]
@@ -331,6 +299,34 @@ mod tests {
                 Some(300.0),
                 "frame {i}: loading 时面板高度应保持 300,实际 {h:?}"
             );
+        }
+
+        {
+            let fm = &mut harness.state_mut().sessions[0].fm;
+            fm.loading = false;
+            fm.transfers = vec![crate::file_manager::Transfer::new(
+                1,
+                "download",
+                "/tmp/混合名称-file.bin".into(),
+                512,
+                1024,
+            )];
+            fm.show_transfers_pane = true;
+        }
+        for (position, name) in [
+            (crate::file_manager::TransferPos::Bottom, "bottom"),
+            (crate::file_manager::TransferPos::Right, "right"),
+        ] {
+            harness.state_mut().sessions[0].fm.transfer_pos = position;
+            for i in 0..12 {
+                harness.step();
+                let h = height(&harness);
+                assert_eq!(
+                    h,
+                    Some(300.0),
+                    "{name} transfer frame {i}: 面板高度应保持 300,实际 {h:?}"
+                );
+            }
         }
     }
 
@@ -626,7 +622,7 @@ mod tests {
                 swap_used_kb: 0,
                 ..Default::default()
             };
-            app.sessions[0].monitor.update(m);
+            app.sessions[0].monitor.update(m.into());
         }
         harness.run_steps(3);
         let img = harness.render().expect("render");

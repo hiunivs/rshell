@@ -4,10 +4,20 @@ use std::sync::{Arc, mpsc};
 
 use crate::config::{self, AppConfig};
 use crate::file_manager::FileManager;
-use crate::install_cjk_fonts;
-use crate::session::monitor::{LocalSampler, SystemMetrics};
+use crate::install_app_fonts;
+use crate::session::monitor::{LocalSampler, ProcInfo, SystemMetrics};
 use crate::session::ssh::SshParams;
 use crate::term_view::{TermDims, TermView};
+
+fn no_file_manager_debug() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var_os("RSHELL_NO_FM").is_some())
+}
+
+fn no_terminal_debug() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var_os("RSHELL_NO_TERM").is_some())
+}
 
 /// 会话类型;SysInfo(源会话 id) 是挂在某个会话下的系统信息页标签
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -22,7 +32,10 @@ pub enum SessionKind {
 /// 侧栏监控视图状态(每个会话一份)
 #[derive(Clone, Default)]
 pub struct MonitorView {
-    pub metrics: Option<SystemMetrics>,
+    pub metrics: Option<Arc<SystemMetrics>>,
+    /// 每次采样时计算一次，UI 每帧只克隆 Arc。
+    pub top_mem: Arc<Vec<ProcInfo>>,
+    pub top_cpu: Arc<Vec<ProcInfo>>,
     /// (rx_bps, tx_bps) 历史,最多 120 点(聚合,不含 lo)
     pub net_history: VecDeque<(f64, f64)>,
     /// 分网卡速率历史(网卡名 → (rx_bps, tx_bps),最多 120 点)
@@ -41,7 +54,7 @@ pub enum ProcSort {
 }
 
 impl MonitorView {
-    pub fn update(&mut self, m: SystemMetrics) {
+    pub fn update(&mut self, m: Arc<SystemMetrics>) {
         self.net_history.push_back((m.net_rx_bps, m.net_tx_bps));
         while self.net_history.len() > 120 {
             self.net_history.pop_front();
@@ -65,8 +78,23 @@ impl MonitorView {
         while self.cpu_history.len() > 120 {
             self.cpu_history.pop_front();
         }
+        self.top_mem = Arc::new(top_procs_owned(&m, ProcSort::Mem));
+        self.top_cpu = Arc::new(top_procs_owned(&m, ProcSort::Cpu));
         self.metrics = Some(m);
     }
+}
+
+fn top_procs_owned(m: &SystemMetrics, sort: ProcSort) -> Vec<ProcInfo> {
+    let mut procs: Vec<_> = m.procs.iter().collect();
+    match sort {
+        ProcSort::Mem => procs.sort_by_key(|p| std::cmp::Reverse(p.rss_kb)),
+        ProcSort::Cpu => procs.sort_by(|a, b| {
+            b.cpu
+                .partial_cmp(&a.cpu)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+    }
+    procs.into_iter().take(10).cloned().collect()
 }
 
 /// 一个连接标签页(本地 shell 或 SSH 会话)
@@ -233,7 +261,7 @@ impl Session {
                     let d = term.dims();
                     match crate::session::local::spawn(d.cols as u16, d.rows as u16, ctx.clone()) {
                         Ok(ch) => {
-                            term.reconnect(ch.cmd_tx, ch.event_rx);
+                            term.reconnect(ch.cmd_tx, ch.data_rx, ch.event_rx);
                             self.fm = FileManager::new(Some(ch.sftp_tx));
                             self.error = None;
                             return;
@@ -269,7 +297,7 @@ impl Session {
                         d.rows as u16,
                         ctx.clone(),
                     );
-                    term.reconnect(ch.cmd_tx, ch.event_rx);
+                    term.reconnect(ch.cmd_tx, ch.data_rx, ch.event_rx);
                     self.fm = FileManager::new_ssh(Some(ch.sftp_tx));
                     self.error = None;
                 } else {
@@ -316,7 +344,7 @@ pub struct RShellApp {
     pub command_new_value: String,
     pub command_new_error: Option<String>,
     // 本机监控采样
-    local_metrics_rx: mpsc::Receiver<SystemMetrics>,
+    local_metrics_rx: mpsc::Receiver<Arc<SystemMetrics>>,
     local_sampling_enabled: Arc<AtomicBool>,
     /// 侧栏进程列表排序列(点击表头切换)
     pub proc_sort: ProcSort,
@@ -345,6 +373,9 @@ pub struct RShellApp {
     pub(crate) terminal_background_texture: Option<TerminalBackgroundTexture>,
     /// 已经尝试过加载的路径，避免无效路径每帧反复读盘。
     pub(crate) terminal_background_load_attempt: Option<String>,
+    /// 后台读取、解码背景图；纹理上传仍在 UI 线程完成。
+    pub(crate) terminal_background_rx:
+        Option<mpsc::Receiver<(String, Result<egui::ColorImage, String>)>>,
     /// 背景图片读取错误，仅在设置页提示。
     pub(crate) terminal_background_error: Option<String>,
     /// 连接库窗口
@@ -367,6 +398,19 @@ pub struct RShellApp {
     pub connection_export_password_confirm: String,
     pub connection_export_error: Option<String>,
     pub connection_import: Option<crate::export::ConnectionImportState>,
+    // ---- 在线预览/编辑 ----
+    /// 内建文件编辑器(独立原生窗口,多文件标签)
+    pub editor: crate::ui::file_editor::EditorState,
+    /// 已发出的 ReadFile(探测/全量读),等 FileContent 事件
+    pub preview_pending: Option<crate::ui::file_editor::PendingRead>,
+    /// 内容嗅探无法判定,已发出 DetectKind,等 KindDetected 事件
+    pub kind_pending: Option<crate::ui::file_editor::PendingKind>,
+    /// 大文件打开确认对话框(>10MB)
+    pub preview_confirm: Option<crate::session::files::FileEntry>,
+    /// 二进制/错误提示对话框
+    pub preview_notice: Option<crate::ui::file_editor::PreviewNotice>,
+    /// 外部程序打开:等待临时下载完成
+    pub external_pending: Option<crate::ui::file_editor::PendingExternal>,
     // ---- 连接库:连接编辑 ----
     pub lc_open: bool,
     pub lc_orig: Option<String>,
@@ -409,10 +453,6 @@ pub struct RShellApp {
     pub key_sel: Option<String>,
     /// 主题偏好
     pub theme_pref: egui::ThemePreference,
-    /// 修复用:传输栏存在时为 true,外层据此修正 PanelState 的 spacing 漂移
-    pub fm_has_transfers: bool,
-    /// 上次无传输时的面板高度(传输清空前要保持)
-    pub fm_last_panel_h: Option<f32>,
 }
 
 impl RShellApp {
@@ -421,8 +461,17 @@ impl RShellApp {
         Self::new_with_config(cc, config::load())
     }
 
-    pub fn new_with_config(cc: &eframe::CreationContext<'_>, loaded_config: AppConfig) -> Self {
-        install_cjk_fonts(&cc.egui_ctx);
+    pub fn new_with_config(cc: &eframe::CreationContext<'_>, mut loaded_config: AppConfig) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+        #[cfg(target_os = "macos")]
+        crate::macos_dock::install_window_menu();
+        install_app_fonts(&cc.egui_ctx, &loaded_config.ssh_terminal.font_family);
+        if !crate::terminal_font_families()
+            .iter()
+            .any(|family| family == &loaded_config.ssh_terminal.font_family)
+        {
+            loaded_config.ssh_terminal.font_family = "Hack".into();
+        }
         let theme_pref = match loaded_config.theme_mode {
             config::ThemeMode::System => egui::ThemePreference::System,
             config::ThemeMode::Dark => egui::ThemePreference::Dark,
@@ -433,21 +482,22 @@ impl RShellApp {
         crate::ui::settings::apply_color_scheme(&cc.egui_ctx, loaded_config.color_scheme);
         crate::secrets::configure(loaded_config.password_storage);
         let config_load_error = config::take_load_error();
-        let (local_metrics_tx, local_metrics_rx) = mpsc::channel();
+        let (local_metrics_tx, local_metrics_rx) = mpsc::sync_channel(1);
         let local_sampling_enabled = Arc::new(AtomicBool::new(false));
-        let sampler_enabled = Arc::clone(&local_sampling_enabled);
-        let sampler_ctx = cc.egui_ctx.clone();
+        let sampler_enabled = Arc::downgrade(&local_sampling_enabled);
         std::thread::spawn(move || {
             let mut sampler = LocalSampler::default();
-            loop {
-                if !sampler_enabled.load(Ordering::Relaxed) {
+            while let Some(enabled) = sampler_enabled.upgrade() {
+                if !enabled.load(Ordering::Relaxed) {
+                    drop(enabled);
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     continue;
                 }
-                if local_metrics_tx.send(sampler.sample()).is_err() {
-                    break;
+                drop(enabled);
+                match local_metrics_tx.try_send(Arc::new(sampler.sample())) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
                 }
-                sampler_ctx.request_repaint();
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         });
@@ -487,6 +537,7 @@ impl RShellApp {
             settings_error: None,
             terminal_background_texture: None,
             terminal_background_load_attempt: None,
+            terminal_background_rx: None,
             terminal_background_error: None,
             show_library: false,
             lib_folder: None,
@@ -501,6 +552,12 @@ impl RShellApp {
             connection_export_password_confirm: String::new(),
             connection_export_error: None,
             connection_import: None,
+            editor: crate::ui::file_editor::EditorState::default(),
+            preview_pending: None,
+            kind_pending: None,
+            preview_confirm: None,
+            preview_notice: None,
+            external_pending: None,
             lc_open: false,
             lc_orig: None,
             lc_alias: String::new(),
@@ -535,8 +592,6 @@ impl RShellApp {
             key_form_assign_to_edit: false,
             key_sel: None,
             theme_pref,
-            fm_has_transfers: false,
-            fm_last_panel_h: None,
         }
     }
 
@@ -544,6 +599,9 @@ impl RShellApp {
     pub fn push_cmd_history(&mut self, cmd: &str) {
         if !cmd.is_empty() && self.cmd_history.last().map(|s| s.as_str()) != Some(cmd) {
             self.cmd_history.push(cmd.to_string());
+            if self.cmd_history.len() > 500 {
+                self.cmd_history.remove(0);
+            }
         }
         self.cmd_hist_idx = None;
         self.cmd_history_draft = None;
@@ -692,7 +750,7 @@ impl eframe::App for RShellApp {
         for session in &mut self.sessions {
             if let Some(term) = session.term.as_mut() {
                 term.poll();
-                for m in term.take_metrics() {
+                if let Some(m) = term.take_metrics() {
                     session.monitor.update(m);
                 }
                 for e in term.take_sftp() {
@@ -712,9 +770,14 @@ impl eframe::App for RShellApp {
         if let Some(m) = latest_metrics {
             for session in &mut self.sessions {
                 if session.kind == SessionKind::Local {
-                    session.monitor.update(m.clone());
+                    session.monitor.update(Arc::clone(&m));
                 }
             }
+        }
+        // 监控采样不再由每个会话分别唤醒 UI；所有会话合并为每秒一次。
+        if self.sessions.iter().any(|session| session.term.is_some()) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
         }
 
         // 3. 顺序决定区域划分：左侧栏(满高)->右上标签栏->底部文件区->中央内容。
@@ -727,61 +790,22 @@ impl eframe::App for RShellApp {
             .get(self.active)
             .is_some_and(|session| matches!(session.kind, SessionKind::SysInfo(_)));
         let active_is_launcher = self.active_is_launcher();
-        if std::env::var_os("RSHELL_NO_FM").is_none() && !active_is_sysinfo && !active_is_launcher {
+        if !no_file_manager_debug() && !active_is_sysinfo && !active_is_launcher {
             self.show_file_manager(ui);
-            // 传输栏的 allocate_rect + scope_builder 给 Panel 内容加了
-            // 多余 item_spacing,每帧累积顶破 PanelState。此处直接写回修正。
-            // 无传输时记下当前高度(后续传输出现时锁定用)
-            {
-                use egui::containers::panel::PanelState;
-                let panel_id = egui::Id::new("file_manager");
-                if self.fm_has_transfers {
-                    if let Some(state) = PanelState::load(ui.ctx(), panel_id) {
-                        let cur = state.outer_rect.height();
-                        // 首帧传输:锁定当前面板高度作为基准
-                        if self.fm_last_panel_h.is_none() {
-                            self.fm_last_panel_h = Some(cur);
-                        }
-                        if let Some(expect) = self.fm_last_panel_h {
-                            let diff = cur - expect;
-                            if diff.abs() < 30.0 {
-                                // 微小变化:spacing 漂移,按回基准
-                                if diff > 0.0 {
-                                    let mut rect = state.outer_rect;
-                                    rect.max.y = rect.min.y + expect;
-                                    ui.ctx().data_mut(|d| {
-                                        d.insert_persisted(
-                                            panel_id,
-                                            PanelState { outer_rect: rect },
-                                        )
-                                    });
-                                } else if diff < 0.0 {
-                                    // 面板缩小,接受新高度为基准
-                                    self.fm_last_panel_h = Some(cur);
-                                }
-                            } else {
-                                // 大幅变化:用户拖动,更新基准
-                                self.fm_last_panel_h = Some(cur);
-                            }
-                        }
-                    }
-                } else {
-                    // 无传输:记住当前高度
-                    if let Some(state) = PanelState::load(ui.ctx(), panel_id) {
-                        self.fm_last_panel_h = Some(state.outer_rect.height());
-                    }
-                }
-            }
         }
-        if std::env::var_os("RSHELL_NO_TERM").is_none() {
+        if !no_terminal_debug() {
             self.show_terminal(ui);
         }
         self.show_session_edit_dialog(ui);
         self.show_hostkey_dialog(ui);
         self.show_settings_dialog(ui);
         self.show_conn_library(ui);
+        self.show_editor_viewport(ui);
+        self.show_preview_dialogs(ui);
         // 侧栏拖拽覆盖条:必须在终端之后注册,否则把手右半边被终端 painter 吃掉
         self.show_sidebar_resize_grip(ui);
+        #[cfg(target_os = "macos")]
+        crate::macos_dock::restore_dock_window_order_if_pending();
     }
 
     fn on_exit(&mut self) {

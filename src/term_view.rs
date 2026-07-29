@@ -16,13 +16,31 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, vec2};
 use crate::session::files::SftpEvent;
 use crate::session::monitor::SystemMetrics;
 use crate::session::ssh::SshParams;
-use crate::session::{self, CmdTx, HostKeyPrompt, SessionCmd, SessionEvent};
+use crate::session::{self, CmdTx, DataRx, HostKeyPrompt, SessionCmd, SessionEvent};
 
 pub struct TermBackground {
     pub color: Color32,
     pub image: Option<egui::TextureHandle>,
     pub image_mode: crate::config::TerminalImageMode,
     pub image_darkness: u8,
+}
+
+struct RenderRun {
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    fg: Color32,
+    flags: Flags,
+    text: String,
+    /// 宽字符占位格结束后封闭当前 run，后续文字从绝对列坐标重新开始。
+    sealed: bool,
+}
+
+struct BackgroundRun {
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    color: Color32,
 }
 
 fn paint_terminal_background(painter: &egui::Painter, rect: Rect, background: &TermBackground) {
@@ -272,7 +290,9 @@ pub struct TermView {
     cmd_tx: CmdTx,
     /// 与 EventProxy 共享的输入通道(reconnect 时替换内层)
     proxy_tx: std::sync::Arc<std::sync::Mutex<CmdTx>>,
+    data_rx: DataRx,
     event_rx: Receiver<SessionEvent>,
+    ctx: egui::Context,
     exited: bool,
     /// 手动断开置位:网格保留可读,不盖"进程已退出"遮罩
     manual_exit: bool,
@@ -296,11 +316,15 @@ pub struct TermView {
     /// 新建会话首次显示终端时请求一次输入焦点。
     request_initial_focus: bool,
     /// poll() 收到的监控指标,等 app 层取走
-    pending_metrics: Vec<SystemMetrics>,
+    pending_metrics: Option<std::sync::Arc<SystemMetrics>>,
     /// poll() 收到的文件服务事件,等 app 层取走
     pending_sftp: Vec<SftpEvent>,
     /// poll() 收到的主机指纹确认请求,等 app 层取走
     pending_hostkey: Vec<HostKeyPrompt>,
+    /// 当前帧的文字 run；只复用 Vec 容量，不复用旧 run 内容和边界。
+    render_runs: Vec<RenderRun>,
+    /// 当前帧的背景 run。与文字 run 分离，选区变化不会重新切分文字。
+    background_runs: Vec<BackgroundRun>,
 }
 
 impl TermView {
@@ -310,7 +334,7 @@ impl TermView {
         dims: TermDims,
     ) -> anyhow::Result<(Self, session::files::SftpTx)> {
         let ch = session::local::spawn(dims.cols as u16, dims.rows as u16, ctx.clone())?;
-        let view = Self::with_channels(ctx, dims, ch.cmd_tx, ch.event_rx);
+        let view = Self::with_channels(ctx, dims, ch.cmd_tx, ch.data_rx, ch.event_rx);
         Ok((view, ch.sftp_tx))
     }
 
@@ -321,7 +345,7 @@ impl TermView {
         params: SshParams,
     ) -> (Self, session::files::SftpTx) {
         let ch = session::ssh::spawn(params, dims.cols as u16, dims.rows as u16, ctx.clone());
-        let view = Self::with_channels(ctx, dims, ch.cmd_tx, ch.event_rx);
+        let view = Self::with_channels(ctx, dims, ch.cmd_tx, ch.data_rx, ch.event_rx);
         (view, ch.sftp_tx)
     }
 
@@ -329,6 +353,7 @@ impl TermView {
         ctx: &egui::Context,
         dims: TermDims,
         cmd_tx: CmdTx,
+        data_rx: DataRx,
         event_rx: Receiver<SessionEvent>,
     ) -> Self {
         let proxy_tx = std::sync::Arc::new(std::sync::Mutex::new(cmd_tx.clone()));
@@ -342,7 +367,9 @@ impl TermView {
             parser: ansi::Processor::new(),
             cmd_tx,
             proxy_tx,
+            data_rx,
             event_rx,
+            ctx: ctx.clone(),
             exited: false,
             manual_exit: false,
             exit_overlay: None,
@@ -354,9 +381,11 @@ impl TermView {
             cursor_blink_epoch: std::time::Instant::now(),
             cursor_was_focused: false,
             request_initial_focus: true,
-            pending_metrics: Vec::new(),
+            pending_metrics: None,
             pending_sftp: Vec::new(),
             pending_hostkey: Vec::new(),
+            render_runs: Vec::with_capacity(128),
+            background_runs: Vec::with_capacity(64),
         }
     }
 
@@ -364,7 +393,6 @@ impl TermView {
     pub fn poll(&mut self) {
         while let Ok(ev) = self.event_rx.try_recv() {
             match ev {
-                SessionEvent::Data(data) => self.parser.advance(&mut self.term, &data),
                 SessionEvent::Exited => {
                     self.exited = true;
                     // 手动断开已有标记线,不再盖遮罩
@@ -372,16 +400,31 @@ impl TermView {
                         self.exit_overlay = Some("进程已退出,点击右侧重连按钮重开");
                     }
                 }
-                SessionEvent::Metrics(m) => self.pending_metrics.push(*m),
+                SessionEvent::Metrics(m) => self.pending_metrics = Some(m),
                 SessionEvent::Sftp(e) => self.pending_sftp.push(e),
                 SessionEvent::VerifyHostKey(p) => self.pending_hostkey.push(*p),
             }
         }
+
+        const MAX_BYTES_PER_FRAME: usize = 2 * 1024 * 1024;
+        const MAX_PARSE_TIME: std::time::Duration = std::time::Duration::from_millis(4);
+        let started = std::time::Instant::now();
+        let mut parsed = 0usize;
+        while parsed < MAX_BYTES_PER_FRAME && started.elapsed() < MAX_PARSE_TIME {
+            let Ok(data) = self.data_rx.try_recv() else {
+                break;
+            };
+            parsed += data.len();
+            self.parser.advance(&mut self.term, &data);
+        }
+        if !self.data_rx.is_empty() {
+            self.ctx.request_repaint();
+        }
     }
 
     /// 取走积压的监控指标
-    pub fn take_metrics(&mut self) -> Vec<SystemMetrics> {
-        std::mem::take(&mut self.pending_metrics)
+    pub fn take_metrics(&mut self) -> Option<std::sync::Arc<SystemMetrics>> {
+        self.pending_metrics.take()
     }
 
     /// 取走积压的文件服务事件
@@ -438,11 +481,12 @@ impl TermView {
     }
 
     /// 复用现有网格重连:只换通道,滚回内容完整保留
-    pub fn reconnect(&mut self, cmd_tx: CmdTx, event_rx: Receiver<SessionEvent>) {
+    pub fn reconnect(&mut self, cmd_tx: CmdTx, data_rx: DataRx, event_rx: Receiver<SessionEvent>) {
         if let Ok(mut guard) = self.proxy_tx.lock() {
             *guard = cmd_tx.clone();
         }
         self.cmd_tx = cmd_tx;
+        self.data_rx = data_rx;
         self.event_rx = event_rx;
         self.exited = false;
         self.manual_exit = false;
@@ -471,8 +515,9 @@ impl TermView {
 
     fn has_selection(&self) -> bool {
         self.term
-            .selection_to_string()
-            .is_some_and(|s| !s.is_empty())
+            .selection
+            .as_ref()
+            .is_some_and(|selection| !selection.is_empty())
     }
 
     fn paste(&mut self, text: &str) {
@@ -499,7 +544,7 @@ impl TermView {
         font_size: f32,
         right_click_paste: bool,
     ) {
-        let font = FontId::monospace(font_size.clamp(8.0, 32.0));
+        let font = crate::terminal_font_id(font_size);
         let (cell_w, cell_h) = ui
             .ctx()
             .fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
@@ -550,6 +595,7 @@ impl TermView {
 
         paint_terminal_background(&painter, rect, background);
 
+        self.handle_scroll(ui, &response, cell_h);
         self.handle_mouse(ui, &response, rect, cell_w, cell_h, right_click_paste);
         let cursor_blink_visible = self.cursor_blink_visible(ui, response.has_focus());
         self.render_grid(
@@ -584,22 +630,6 @@ impl TermView {
         }
 
         self.handle_keyboard(ui, &response);
-
-        // 鼠标滚轮滚回:累积不足一行的增量,流畅滚动
-        if response.hovered() {
-            let delta = ui.input(|i| i.smooth_scroll_delta.y);
-            if delta != 0.0 {
-                self.selection_copy_pos = None;
-                self.scroll_acc += delta / cell_h;
-                let lines = self.scroll_acc.trunc() as i32;
-                if lines != 0 {
-                    self.scroll_acc -= lines as f32;
-                    self.term.scroll_display(Scroll::Delta(lines));
-                }
-            }
-        } else {
-            self.scroll_acc = 0.0;
-        }
 
         self.show_selection_copy_button(ui, response.id, rect);
 
@@ -636,6 +666,27 @@ impl TermView {
         (elapsed.as_millis() / phase_millis).is_multiple_of(2)
     }
 
+    /// 鼠标滚轮滚回。拖选时也允许滚动；选区锚点使用终端绝对坐标，
+    /// 滚动后 `handle_mouse` 会按新的 display_offset 更新活动端点。
+    fn handle_scroll(&mut self, ui: &egui::Ui, response: &egui::Response, cell_h: f32) {
+        let dragging = response.dragged_by(egui::PointerButton::Primary);
+        if response.hovered() || dragging {
+            let delta = ui.input(|input| input.smooth_scroll_delta.y);
+            if delta != 0.0 {
+                self.selection_copy_pos = None;
+                self.scroll_acc += delta / cell_h;
+                let lines = self.scroll_acc.trunc() as i32;
+                if lines != 0 {
+                    self.scroll_acc -= lines as f32;
+                    self.term.scroll_display(Scroll::Delta(lines));
+                    ui.ctx().request_repaint();
+                }
+            }
+        } else {
+            self.scroll_acc = 0.0;
+        }
+    }
+
     /// 按行聚合绘制终端网格
     fn render_grid(
         &mut self,
@@ -648,24 +699,18 @@ impl TermView {
     ) {
         let cell_w = cell_size.x;
         let cell_h = cell_size.y;
-        struct Run {
-            row: usize,
-            start_col: usize,
-            end_col: usize, // 开区间
-            fg: Color32,
-            bg: Color32,
-            paint_bg: bool,
-            flags: Flags,
-            text: String,
-        }
-
         let content = self.term.renderable_content();
         let display_offset = content.display_offset;
         let colors = content.colors;
         let cursor_vp = term::point_to_viewport(display_offset, content.cursor.point);
         let cursor_visible = cursor_blink_visible && content.cursor.shape != CursorShape::Hidden;
 
-        let mut runs: Vec<Run> = Vec::with_capacity(128);
+        // 背景与文字使用不同的 run。选区只会切分背景，不会改变文字 shaping
+        // 的边界，避免缩进、宽字符或字体回退在拖选时发生位移和重绘叠加。
+        self.render_runs.clear();
+        self.background_runs.clear();
+        let runs = &mut self.render_runs;
+        let backgrounds = &mut self.background_runs;
 
         for indexed in content.display_iter {
             let point = indexed.point;
@@ -700,6 +745,20 @@ impl TermView {
                 paint_bg = true;
             }
 
+            if paint_bg {
+                match backgrounds.last_mut() {
+                    Some(run) if run.row == row && run.end_col == col && run.color == bg => {
+                        run.end_col = col + 1;
+                    }
+                    _ => backgrounds.push(BackgroundRun {
+                        row,
+                        start_col: col,
+                        end_col: col + 1,
+                        color: bg,
+                    }),
+                }
+            }
+
             let ch = if cell.flags.contains(Flags::HIDDEN) {
                 ' '
             } else {
@@ -708,50 +767,63 @@ impl TermView {
 
             // 宽字符占位格:只并入背景,不追加文本
             let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+            let flags = flags_relevant(cell.flags);
 
             match runs.last_mut() {
                 Some(run)
                     if run.row == row
                         && run.end_col == col
                         && run.fg == fg
-                        && run.bg == bg
-                        && run.paint_bg == paint_bg
-                        && run.flags == flags_relevant(cell.flags)
+                        && run.flags == flags
+                        && !run.sealed
                         && !is_cursor =>
                 {
-                    if !spacer {
+                    if spacer {
+                        run.sealed = true;
+                    } else {
                         run.text.push(ch);
                     }
                     run.end_col = col + 1;
                 }
                 _ => {
+                    // spacer 是前一个宽字符的第二个网格单元，不应成为独立文字。
+                    if spacer {
+                        continue;
+                    }
+                    // 不把行首/缩进空格放进待 shaping 的字符串。文字直接从真实
+                    // 单元格列开始绘制，选区变化时不会因前导空格重新排版而偏移。
+                    if ch == ' ' && !flags.intersects(Flags::UNDERLINE | Flags::STRIKEOUT) {
+                        continue;
+                    }
                     // 光标单元格强制独立 run,避免颜色被相邻合并后错位
-                    runs.push(Run {
+                    runs.push(RenderRun {
                         row,
                         start_col: col,
                         end_col: col + 1,
                         fg,
-                        bg,
-                        paint_bg,
-                        flags: flags_relevant(cell.flags),
-                        text: if spacer {
-                            String::new()
-                        } else {
-                            ch.to_string()
-                        },
+                        flags,
+                        text: ch.to_string(),
+                        sealed: false,
                     });
                 }
             }
         }
 
-        for run in &runs {
+        // 先统一绘制全部背景，再绘制文字。否则后一个选区 run 的背景可能覆盖
+        // 前一个文字 run 在字形边缘处的像素。
+        for run in backgrounds.iter() {
             let x = rect.left() + run.start_col as f32 * cell_w;
             let y = rect.top() + run.row as f32 * cell_h;
             let w = (run.end_col - run.start_col) as f32 * cell_w;
             let run_rect = Rect::from_min_size(Pos2::new(x, y), vec2(w, cell_h));
-            if run.paint_bg {
-                painter.rect_filled(run_rect, 0.0, run.bg);
-            }
+            painter.rect_filled(run_rect, 0.0, run.color);
+        }
+
+        for run in runs.iter() {
+            let x = rect.left() + run.start_col as f32 * cell_w;
+            let y = rect.top() + run.row as f32 * cell_h;
+            let w = (run.end_col - run.start_col) as f32 * cell_w;
+            let run_rect = Rect::from_min_size(Pos2::new(x, y), vec2(w, cell_h));
             if !run.text.trim().is_empty() {
                 painter.text(
                     Pos2::new(x, y),
@@ -834,6 +906,20 @@ impl TermView {
         cell_h: f32,
         right_click_paste: bool,
     ) {
+        // 拖到可视区域上下边缘时持续滚动，并在滚动后的视口坐标中更新
+        // 选区活动端点。即使鼠标停在边缘不动也要继续请求下一帧。
+        if self.sel_anchor.is_some()
+            && response.dragged_by(egui::PointerButton::Primary)
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let lines = selection_autoscroll_lines(pos.y, rect, cell_h);
+            if lines != 0 {
+                self.term.scroll_display(Scroll::Delta(lines));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
+
         let display_offset = self.term.grid().display_offset();
         let to_point = |pos: Pos2| -> Point {
             let col = ((pos.x - rect.left()) / cell_w)
@@ -939,8 +1025,8 @@ impl TermView {
                         copy_clicked = ui
                             .add_sized(
                                 [28.0, 24.0],
-                                egui::Button::new(
-                                    egui::RichText::new("⧉").size(16.0).color(Color32::WHITE),
+                                egui::Button::image(
+                                    crate::ui::icons::Icon::Copy.image(16.0, Color32::WHITE),
                                 )
                                 .frame(false),
                             )
@@ -1095,6 +1181,20 @@ fn flags_relevant(flags: Flags) -> Flags {
     flags & (Flags::UNDERLINE | Flags::STRIKEOUT)
 }
 
+/// 拖选靠近上下边缘时的滚动方向和速度。向上滚回为正，向下为负。
+fn selection_autoscroll_lines(pointer_y: f32, rect: Rect, cell_h: f32) -> i32 {
+    let edge = cell_h.max(1.0).min(rect.height() * 0.25);
+    let distance = if pointer_y < rect.top() + edge {
+        rect.top() + edge - pointer_y
+    } else if pointer_y > rect.bottom() - edge {
+        -(pointer_y - (rect.bottom() - edge))
+    } else {
+        return 0;
+    };
+    let speed = (distance.abs() / cell_h.max(1.0)).ceil().clamp(1.0, 6.0) as i32;
+    speed * distance.signum() as i32
+}
+
 /// 字母键 → 0(A)..=25(Z)
 fn letter_index(key: egui::Key) -> Option<u8> {
     use egui::Key;
@@ -1127,4 +1227,19 @@ fn letter_index(key: egui::Key) -> Option<u8> {
         Key::Z => 25,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_autoscroll_uses_terminal_scroll_direction() {
+        let rect = Rect::from_min_max(Pos2::new(0.0, 10.0), Pos2::new(400.0, 210.0));
+        assert_eq!(selection_autoscroll_lines(110.0, rect, 20.0), 0);
+        assert_eq!(selection_autoscroll_lines(15.0, rect, 20.0), 1);
+        assert_eq!(selection_autoscroll_lines(205.0, rect, 20.0), -1);
+        assert_eq!(selection_autoscroll_lines(-200.0, rect, 20.0), 6);
+        assert_eq!(selection_autoscroll_lines(500.0, rect, 20.0), -6);
+    }
 }

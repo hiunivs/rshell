@@ -1,8 +1,42 @@
 use crate::app::{BottomTab, RShellApp};
+use crate::config::TransferSettings;
 use crate::file_manager::{FileManager, SortCol, TransferPos};
 use crate::session::files::{FileEntry, SftpCmd, join_path, normalize_path};
-use crate::ui::sidebar::fmt_bytes;
+use crate::ui::icons::{Icon, icon_button};
+use crate::ui::sidebar::{fmt_bytes, fmt_rate};
 use egui::{Color32, Pos2, RichText, Stroke, vec2};
+
+/// 按传输设置解析文件下载的本地目标路径;None = 用户取消。
+/// 固定目录模式下直接拼接目标文件名(同名覆盖),否则弹系统保存对话框。
+pub(crate) fn resolve_file_download_target(ts: &TransferSettings, name: &str) -> Option<String> {
+    if let Some(dir) = ts.effective_download_dir() {
+        return Some(
+            std::path::Path::new(dir)
+                .join(name)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    rfd::FileDialog::new()
+        .set_file_name(name)
+        .save_file()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// 按传输设置解析目录下载的本地目标;固定模式下以远程目录名建子目录。
+pub(crate) fn resolve_dir_download_target(ts: &TransferSettings, name: &str) -> Option<String> {
+    if let Some(dir) = ts.effective_download_dir() {
+        return Some(
+            std::path::Path::new(dir)
+                .join(name)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    rfd::FileDialog::new()
+        .pick_folder()
+        .map(|p| p.to_string_lossy().into_owned())
+}
 
 /// 常用命令预设(名称, 命令)
 const COMMON_COMMANDS: &[(&str, &str)] = &[
@@ -27,6 +61,8 @@ impl RShellApp {
     /// 底部文件管理器面板
     pub(crate) fn show_file_manager(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        // 预览/编辑请求与事件收件箱(上一帧由文件表/会话线程产生)
+        self.drain_file_requests();
         // 原生可拖拽 Panel 在悬停/拖动时使用黑色前景描边。
         // 仅为面板分隔条临时换成低对比度细线，内部控件仍使用原样式。
         let hovered_fg = ui.visuals().widgets.hovered.fg_stroke;
@@ -63,11 +99,38 @@ impl RShellApp {
                         // SysInfo 标签页时操作源会话的文件服务
                         if let Some(idx) = self.effective_session_idx() {
                             let fm = &mut self.sessions[idx].fm;
-                            fm_toolbar(ui, fm);
+                            fm_toolbar(ui, fm, &self.config.transfers);
                             ui.separator();
-                            // 关键:为传输栏 + 底栏预留高度,
-                            // 主体区域用显式矩形填满,内容始终占满面板
-                            let btn_h = 24.0; // 底栏:右下角按钮
+                            // 剩余区域只在父布局中分配一次；主体和底栏都用绝对定位的
+                            // child UI 绘制，内部字体行高不得反向撑大可缩放 Panel。
+                            let content_rect = ui.available_rect_before_wrap();
+                            let _ = ui.allocate_rect(content_rect, egui::Sense::hover());
+                            let footer_h = ui
+                                .spacing()
+                                .interact_size
+                                .y
+                                .max(ui.text_style_height(&egui::TextStyle::Button));
+                            let footer_rect = egui::Rect::from_min_max(
+                                egui::pos2(
+                                    content_rect.left(),
+                                    (content_rect.bottom() - footer_h).max(content_rect.top()),
+                                ),
+                                content_rect.max,
+                            );
+                            let work_rect = egui::Rect::from_min_max(
+                                content_rect.min,
+                                egui::pos2(
+                                    content_rect.right(),
+                                    (footer_rect.top() - ui.spacing().item_spacing.y)
+                                        .max(content_rect.top()),
+                                ),
+                            );
+                            let mut work_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .id_salt("fm_work")
+                                    .max_rect(work_rect)
+                                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                            );
                             let transfers_visible =
                                 fm.show_transfers_pane && !fm.transfers.is_empty();
                             let transfers_h = if transfers_visible {
@@ -78,18 +141,25 @@ impl RShellApp {
                             if transfers_visible && fm.transfer_pos == TransferPos::Right {
                                 // 右侧布局:文件列表(左) + 传输窗(右,固定 220px)
                                 let trans_w = 220.0;
-                                let body_w = (ui.available_width() - trans_w - 4.0).max(150.0);
-                                let content_h = (ui.available_height() - btn_h).max(60.0);
+                                let body_w = (work_rect.width() - trans_w - 4.0).max(150.0);
+                                let content_h = work_rect.height().max(60.0);
                                 let body_rect = egui::Rect::from_min_size(
-                                    ui.next_widget_position(),
+                                    work_rect.min,
                                     vec2(body_w, content_h),
                                 );
                                 let tree_w =
                                     fm.tree_width.clamp(100.0, (body_w - 220.0).max(100.0));
-                                let _ = ui.allocate_rect(body_rect, egui::Sense::hover());
-                                ui.scope_builder(
-                                    egui::UiBuilder::new().max_rect(body_rect),
-                                    |ui| fm_tree_and_table(ui, fm, tree_w, body_rect),
+                                let mut body_ui = work_ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .id_salt("fm_right_body")
+                                        .max_rect(body_rect),
+                                );
+                                fm_tree_and_table(
+                                    &mut body_ui,
+                                    fm,
+                                    tree_w,
+                                    body_rect,
+                                    &self.config.transfers,
                                 );
                                 // 分隔线(文件列表与传输窗之间)
                                 let sep_x = body_rect.right() + 1.0;
@@ -103,62 +173,67 @@ impl RShellApp {
                                     egui::pos2(sep_x + 5.0, body_rect.top()),
                                     vec2(trans_w, content_h),
                                 );
-                                let _ = ui.allocate_rect(trans_rect, egui::Sense::hover());
-                                ui.scope_builder(
+                                let mut transfer_ui = work_ui.new_child(
                                     egui::UiBuilder::new()
+                                        .id_salt("fm_right_transfers")
                                         .max_rect(trans_rect)
                                         .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                                    |ui| {
-                                        fm_transfers(ui, fm, content_h, TransferPos::Right);
-                                    },
                                 );
+                                fm_transfers(&mut transfer_ui, fm, content_h, TransferPos::Right);
                             } else {
                                 // 底部布局(默认)
+                                let transfer_gap = if transfers_visible {
+                                    work_ui.spacing().item_spacing.y
+                                } else {
+                                    0.0
+                                };
                                 let body_h =
-                                    (ui.available_height() - transfers_h - btn_h).max(40.0);
-                                fm_body(ui, fm, body_h);
+                                    (work_rect.height() - transfers_h - transfer_gap).max(40.0);
+                                fm_body(&mut work_ui, fm, body_h, &self.config.transfers);
                                 if transfers_visible {
-                                    fm_transfers(ui, fm, transfers_h, TransferPos::Bottom);
+                                    fm_transfers(
+                                        &mut work_ui,
+                                        fm,
+                                        transfers_h,
+                                        TransferPos::Bottom,
+                                    );
                                 }
                             }
                             // === 底栏:右下角按钮 ===
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if transfer_pane_toggle(ui, fm.show_transfers_pane).clicked() {
-                                        fm.show_transfers_pane = !fm.show_transfers_pane;
-                                    }
-                                    // 汉堡按钮嵌在 menu_button 里:弹窗自动贴按钮定位,不占布局
-                                    ui.menu_button(RichText::new("≡"), |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                fm.transfer_pos == TransferPos::Bottom,
-                                                "底部",
-                                            )
-                                            .clicked()
-                                        {
-                                            fm.transfer_pos = TransferPos::Bottom;
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .selectable_label(
-                                                fm.transfer_pos == TransferPos::Right,
-                                                "右侧",
-                                            )
-                                            .clicked()
-                                        {
-                                            fm.transfer_pos = TransferPos::Right;
-                                            ui.close();
-                                        }
-                                    });
-                                },
+                            let mut footer_ui = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .id_salt("fm_footer")
+                                    .max_rect(footer_rect)
+                                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
                             );
+                            if transfer_pane_toggle(&mut footer_ui, fm.show_transfers_pane)
+                                .clicked()
+                            {
+                                fm.show_transfers_pane = !fm.show_transfers_pane;
+                            }
+                            // 汉堡按钮嵌在 menu_button 里:弹窗自动贴按钮定位,不占布局
+                            footer_ui.menu_button(RichText::new("≡"), |ui| {
+                                if ui
+                                    .selectable_label(
+                                        fm.transfer_pos == TransferPos::Bottom,
+                                        "底部",
+                                    )
+                                    .clicked()
+                                {
+                                    fm.transfer_pos = TransferPos::Bottom;
+                                    ui.close();
+                                }
+                                if ui
+                                    .selectable_label(fm.transfer_pos == TransferPos::Right, "右侧")
+                                    .clicked()
+                                {
+                                    fm.transfer_pos = TransferPos::Right;
+                                    ui.close();
+                                }
+                            });
                             fm_dialogs(ui, fm);
                             fm_drag_drop(ui, fm);
-                            // 记下传输状态:外层在 Panel 返回后修正高度
-                            self.fm_has_transfers = transfers_visible;
                         } else {
-                            self.fm_has_transfers = false;
                             fill_rect(ui, |ui| {
                                 ui.label("（无会话）");
                             });
@@ -166,7 +241,6 @@ impl RShellApp {
                     }
                     BottomTab::Commands => {
                         // 常用命令:点击直接发送到当前终端;同样显式填满,保持面板高度一致
-                        self.fm_has_transfers = false;
                         fill_rect(ui, |ui| {
                             egui::ScrollArea::vertical()
                                 .id_salt("cmd_list")
@@ -370,7 +444,7 @@ fn transfer_pane_toggle(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
     resp
 }
 
-fn fm_toolbar(ui: &mut egui::Ui, fm: &mut FileManager) {
+fn fm_toolbar(ui: &mut egui::Ui, fm: &mut FileManager, ts: &TransferSettings) {
     ui.horizontal(|ui| {
         // 路径框:缩短,给右侧按钮 + 加载提示预留固定宽度
         let resp = ui.add(
@@ -423,14 +497,11 @@ fn fm_toolbar(ui: &mut egui::Ui, fm: &mut FileManager) {
         if ui.button("⇩ 下载").clicked() {
             if let Some(entry) = sel_entry {
                 if entry.is_dir {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        fm.start_download_dir(&entry, path.to_string_lossy().into_owned());
+                    if let Some(path) = resolve_dir_download_target(ts, &entry.name) {
+                        fm.start_download_dir(&entry, path);
                     }
-                } else if let Some(path) = rfd::FileDialog::new()
-                    .set_file_name(&entry.name)
-                    .save_file()
-                {
-                    fm.start_download(&entry, path.to_string_lossy().into_owned());
+                } else if let Some(path) = resolve_file_download_target(ts, &entry.name) {
+                    fm.start_download(&entry, path);
                 }
             } else {
                 fm.error = Some("请先选中一个文件或目录".into());
@@ -454,11 +525,11 @@ fn transfers_height(fm: &FileManager, pos: TransferPos) -> f32 {
         } else {
             20.0
         };
-        44.0 + fm.transfers.len() as f32 * row_h
+        (44.0 + fm.transfers.len() as f32 * row_h).min(220.0)
     }
 }
 
-fn fm_body(ui: &mut egui::Ui, fm: &mut FileManager, height: f32) {
+fn fm_body(ui: &mut egui::Ui, fm: &mut FileManager, height: f32, ts: &TransferSettings) {
     let tree_w = fm
         .tree_width
         .clamp(100.0, (ui.available_width() - 220.0).max(100.0));
@@ -467,13 +538,25 @@ fn fm_body(ui: &mut egui::Ui, fm: &mut FileManager, height: f32) {
         vec2(ui.available_width(), height),
     );
     let _ = ui.allocate_rect(body_rect, egui::Sense::hover());
-    ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
-        fm_tree_and_table(ui, fm, tree_w, body_rect)
-    });
+    // body_rect 已经由父 UI 分配；这里必须使用不参与父布局的 child UI。
+    // scope_builder 会再次用子 UI 的 min_rect 推进父游标，子内容只要因字体
+    // 行高超出 1px，就会把该 1px 写回可缩放 PanelState 并逐帧累加。
+    let mut body_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("fm_body")
+            .max_rect(body_rect),
+    );
+    fm_tree_and_table(&mut body_ui, fm, tree_w, body_rect, ts);
 }
 
 /// 目录树 + 文件表的渲染内容(外层已分配矩形,此函数只画内容)
-fn fm_tree_and_table(ui: &mut egui::Ui, fm: &mut FileManager, tree_w: f32, body_rect: egui::Rect) {
+fn fm_tree_and_table(
+    ui: &mut egui::Ui,
+    fm: &mut FileManager,
+    tree_w: f32,
+    body_rect: egui::Rect,
+    ts: &TransferSettings,
+) {
     let height = body_rect.height();
     // 左:目录树
     let tree_rect = egui::Rect::from_min_size(body_rect.min, vec2(tree_w, height));
@@ -519,7 +602,7 @@ fn fm_tree_and_table(ui: &mut egui::Ui, fm: &mut FileManager, tree_w: f32, body_
                 .id_salt("fm_table_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    fm_table(ui, fm);
+                    fm_table(ui, fm, ts);
                 });
         },
     );
@@ -549,47 +632,26 @@ fn fm_tree_and_table(ui: &mut egui::Ui, fm: &mut FileManager, tree_w: f32, body_
     }
 }
 
-/// 目录树的可见行(深度优先展开)
-fn tree_rows(fm: &FileManager) -> Vec<(String, usize, bool, bool)> {
-    // (路径, 深度, 已展开, 加载中)
-    let mut rows = Vec::new();
-    let mut stack = vec![("/".to_string(), 0usize)];
-    while let Some((path, depth)) = stack.pop() {
-        let expanded = fm.tree_expanded.contains(&path);
-        let loading = fm.tree_loading.contains(&path);
-        rows.push((path.clone(), depth, expanded, loading));
-        if expanded
-            && depth < 16
-            && let Some(children) = fm.tree_children.get(&path)
-        {
-            for c in children.iter().rev() {
-                stack.push((c.full_path(&path), depth + 1));
-            }
-        }
-    }
-    rows
-}
-
 fn fm_tree(ui: &mut egui::Ui, fm: &mut FileManager) {
-    let rows = tree_rows(fm);
-    for (path, depth, expanded, loading) in rows {
-        let is_cwd = normalize_path(&path) == fm.cwd;
+    let rows = fm.visible_tree_rows();
+    for (path, depth, expanded, loading) in rows.iter() {
+        let is_cwd = normalize_path(path) == fm.cwd;
         // 子项已加载(展开过/已取回子目录)→ 蓝色;否则灰蓝色
-        let loaded = fm.tree_children.contains_key(&path);
+        let loaded = fm.tree_children.contains_key(path.as_str());
         ui.horizontal(|ui| {
-            ui.add_space(4.0 + depth as f32 * 14.0);
+            ui.add_space(4.0 + *depth as f32 * 14.0);
             // 未展开时不显示收起箭头；展开后才显示 ▼，固定占位保持目录对齐。
-            if expanded {
-                let collapse = ui
-                    .add(
-                        egui::Button::new(RichText::new("▼").size(9.0))
-                            .frame(false)
-                            .min_size(vec2(12.0, 14.0)),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("收起");
+            if *expanded {
+                let collapse = icon_button(
+                    ui,
+                    Icon::ChevronDown,
+                    "收起",
+                    vec2(12.0, 14.0),
+                    10.0,
+                    ui.visuals().weak_text_color(),
+                );
                 if collapse.clicked() {
-                    fm.toggle_tree(&path);
+                    fm.toggle_tree(path);
                 }
             } else {
                 ui.allocate_exact_size(vec2(12.0, 14.0), egui::Sense::hover());
@@ -601,32 +663,42 @@ fn fm_tree(ui: &mut egui::Ui, fm: &mut FileManager) {
             } else {
                 Color32::from_rgb(0x9A, 0xB0, 0xC8)
             };
-            draw_folder_icon(&ui.painter_at(icon_rect), icon_rect, color);
-            let text = if path == "/" {
+            draw_folder_icon(ui, icon_rect, color);
+            let dir_name = if path == "/" {
                 "/".to_string()
             } else {
-                path.rsplit('/').next().unwrap_or(&path).to_string()
+                path.rsplit('/').next().unwrap_or(path).to_string()
             };
             let label = if is_cwd {
-                RichText::new(text).strong()
+                RichText::new(&dir_name).strong()
             } else {
-                RichText::new(text)
+                RichText::new(&dir_name)
             };
-            if ui
+            let dir_response = ui
                 .add(
                     egui::Label::new(label)
+                        .selectable(false)
                         .sense(egui::Sense::click())
                         .truncate(),
                 )
-                .on_hover_cursor(egui::CursorIcon::Default)
-                .on_hover_text(&path)
-                .clicked()
-            {
+                .on_hover_and_drag_cursor(egui::CursorIcon::Default)
+                .on_hover_text(path.as_str());
+            if dir_response.clicked() {
                 // 点击目录名:展开该节点并进入该目录
-                fm.expand_tree(&path);
-                fm.navigate(&path);
+                fm.expand_tree(path);
+                fm.navigate(path);
             }
-            if loading {
+            dir_response.context_menu(|ui| {
+                if ui.button("复制目录名").clicked() {
+                    ui.ctx().copy_text(dir_name.clone());
+                    ui.close();
+                }
+                if ui.button("复制完整路径").clicked() {
+                    ui.ctx().copy_text(path.clone());
+                    ui.close();
+                }
+            });
+            if *loading {
                 ui.label(RichText::new("…").weak().small());
             }
         });
@@ -637,7 +709,7 @@ fn fm_tree(ui: &mut egui::Ui, fm: &mut FileManager) {
 // 文件表格
 // ---------------------------------------------------------------------------
 
-fn fm_table(ui: &mut egui::Ui, fm: &mut FileManager) {
+fn fm_table(ui: &mut egui::Ui, fm: &mut FileManager, ts: &TransferSettings) {
     use egui_extras::{Column, TableBuilder};
 
     // 注意:错误/加载提示不在这里加控件——表格区域是固定矩形,
@@ -645,6 +717,29 @@ fn fm_table(ui: &mut egui::Ui, fm: &mut FileManager) {
     // 提示由 fm_body 用 painter 覆盖层绘制,不占布局空间
 
     let row_h = 20.0;
+    // egui_extras 只用 cell 自身的 response 记忆悬停行，cell 内后注册的
+    // Label 会截走文字区域的 hover。额外缓存合并响应命中的行，下一帧在
+    // 绘制所有单元格前统一 set_hovered，保证文字、图标和空白处高亮一致。
+    let content_hover_id = ui.id().with("fm_table_content_hover");
+    let ctx = ui.ctx().clone();
+    let copy_shortcut = ui.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::C,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.command
+            )
+        })
+    });
+    let previous_hovered = ui
+        .ctx()
+        .data(|data| data.get_temp::<Option<usize>>(content_hover_id))
+        .flatten();
+    let mut current_hovered = None;
     TableBuilder::new(ui)
         .striped(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
@@ -680,27 +775,60 @@ fn fm_table(ui: &mut egui::Ui, fm: &mut FileManager) {
                 let i = row.index();
                 let entry = fm.entries[i].clone();
                 let selected = fm.selected == Some(i);
+                row.set_hovered(previous_hovered == Some(i));
                 row.set_selected(selected);
+                let mut content_responses = Vec::with_capacity(7);
 
                 row.col(|ui| {
-                    draw_file_icon(ui, &entry);
-                    ui.add(egui::Label::new(&entry.name).truncate());
+                    content_responses.push(draw_file_icon(ui, &entry));
+                    content_responses.push(
+                        ui.add(
+                            egui::Label::new(&entry.name)
+                                .truncate()
+                                .selectable(false)
+                                .sense(egui::Sense::click()),
+                        ),
+                    );
                 });
                 row.col(|ui| {
-                    ui.label(if entry.is_dir {
-                        String::new()
-                    } else {
-                        fmt_bytes(entry.size)
-                    });
+                    content_responses.push(
+                        ui.add(
+                            egui::Label::new(if entry.is_dir {
+                                String::new()
+                            } else {
+                                fmt_bytes(entry.size)
+                            })
+                            .selectable(false)
+                            .sense(egui::Sense::click()),
+                        ),
+                    );
                 });
                 row.col(|ui| {
-                    ui.label(if entry.is_dir { "文件夹" } else { "文件" });
+                    content_responses.push(
+                        ui.add(
+                            egui::Label::new(if entry.is_dir { "文件夹" } else { "文件" })
+                                .selectable(false)
+                                .sense(egui::Sense::click()),
+                        ),
+                    );
                 });
                 row.col(|ui| {
-                    ui.label(entry.mtime_string());
+                    content_responses.push(
+                        ui.add(
+                            egui::Label::new(entry.mtime_string())
+                                .selectable(false)
+                                .sense(egui::Sense::click()),
+                        ),
+                    );
                 });
                 row.col(|ui| {
-                    ui.label(entry.perm_string());
+                    content_responses.push(
+                        ui.add(
+                            egui::Label::new(entry.perm_string())
+                                .selectable(false)
+                                .sense(egui::Sense::click()),
+                        ),
+                    );
                 });
                 row.col(|ui| {
                     let owner = if entry.owner.is_empty() {
@@ -708,22 +836,45 @@ fn fm_table(ui: &mut egui::Ui, fm: &mut FileManager) {
                     } else {
                         format!("{}/{}", entry.owner, entry.group)
                     };
-                    ui.label(owner);
+                    content_responses.push(
+                        ui.add(
+                            egui::Label::new(owner)
+                                .selectable(false)
+                                .sense(egui::Sense::click()),
+                        ),
+                    );
                 });
 
-                let resp = row.response();
+                // TableRow 的 cell response 不会自动包含 cell 内后注册控件的点击；
+                // 合并所有文字/图标响应后，整行任意位置拥有相同的交互语义。
+                let resp = content_responses
+                    .into_iter()
+                    .fold(row.response(), |row_response, content_response| {
+                        row_response.union(content_response)
+                    })
+                    .on_hover_and_drag_cursor(egui::CursorIcon::Default);
+                if resp.contains_pointer() {
+                    current_hovered = Some(i);
+                }
+                if selected && resp.clicked_elsewhere() {
+                    fm.table_keyboard_active = false;
+                }
                 if resp.clicked() {
                     fm.selected = Some(i);
+                    fm.table_keyboard_active = true;
+                }
+                // 仅当最后一次明确点击的是文件行时响应复制快捷键；
+                // 点击其他区域会由 clicked_elsewhere 立即撤销，避免抢占终端或编辑器。
+                if selected && fm.table_keyboard_active && copy_shortcut {
+                    ctx.copy_text(entry.full_path(&fm.cwd));
                 }
                 if resp.double_clicked() {
                     if entry.is_dir {
                         let p = entry.full_path(&fm.cwd);
                         fm.navigate(&p);
-                    } else if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name(&entry.name)
-                        .save_file()
-                    {
-                        fm.start_download(&entry, path.to_string_lossy().into_owned());
+                    } else {
+                        // 双击文件:在线预览/编辑(类型判定后决定内建/外部/提示)
+                        fm.request_preview = Some(entry.clone());
                     }
                 }
                 resp.context_menu(|ui| {
@@ -732,16 +883,21 @@ fn fm_table(ui: &mut egui::Ui, fm: &mut FileManager) {
                         fm.navigate(&p);
                         ui.close();
                     }
+                    if !entry.is_dir && ui.button("打开").clicked() {
+                        fm.request_preview = Some(entry.clone());
+                        ui.close();
+                    }
+                    if !entry.is_dir && ui.button("用本地程序打开…").clicked() {
+                        fm.request_external_open = Some(entry.clone());
+                        ui.close();
+                    }
                     if ui.button("下载").clicked() {
                         if entry.is_dir {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                fm.start_download_dir(&entry, path.to_string_lossy().into_owned());
+                            if let Some(path) = resolve_dir_download_target(ts, &entry.name) {
+                                fm.start_download_dir(&entry, path);
                             }
-                        } else if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name(&entry.name)
-                            .save_file()
-                        {
-                            fm.start_download(&entry, path.to_string_lossy().into_owned());
+                        } else if let Some(path) = resolve_file_download_target(ts, &entry.name) {
+                            fm.start_download(&entry, path);
                         }
                         ui.close();
                     }
@@ -750,7 +906,7 @@ fn fm_table(ui: &mut egui::Ui, fm: &mut FileManager) {
                         fm.dialogs.rename_name = entry.name.clone();
                         ui.close();
                     }
-                    if ui.button("复制路径").clicked() {
+                    if ui.button("复制完整路径").clicked() {
                         ui.ctx().copy_text(entry.full_path(&fm.cwd));
                         ui.close();
                     }
@@ -789,6 +945,11 @@ fn fm_table(ui: &mut egui::Ui, fm: &mut FileManager) {
                 });
             });
         });
+    if current_hovered != previous_hovered {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(content_hover_id, current_hovered));
+        ui.ctx().request_repaint();
+    }
 }
 
 fn sort_header(ui: &mut egui::Ui, fm: &mut FileManager, col: SortCol, text: &str) {
@@ -805,30 +966,20 @@ fn sort_header(ui: &mut egui::Ui, fm: &mut FileManager, col: SortCol, text: &str
     }
 }
 
-/// 文件夹图标(主体 + 顶部 tab),颜色由调用方给定
-pub(crate) fn draw_folder_icon(painter: &egui::Painter, rect: egui::Rect, c: Color32) {
-    let body = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), rect.top() + 3.0),
-        rect.right_bottom(),
-    );
-    let tab = egui::Rect::from_min_size(egui::pos2(rect.left(), rect.top()), vec2(6.0, 4.0));
-    painter.rect_filled(body, 1.5, c);
-    painter.rect_filled(tab, 1.0, c);
+/// 统一的 Lucide 文件夹图标，颜色由调用方给定。
+pub(crate) fn draw_folder_icon(ui: &egui::Ui, rect: egui::Rect, color: Color32) {
+    Icon::Folder.paint_at(ui, rect, color);
 }
 
 /// 小图标:文件夹蓝色/文件灰色
-fn draw_file_icon(ui: &mut egui::Ui, entry: &FileEntry) {
-    let (rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
-    let p = ui.painter_at(rect);
+fn draw_file_icon(ui: &mut egui::Ui, entry: &FileEntry) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::click());
     if entry.is_dir {
-        draw_folder_icon(&p, rect, Color32::from_rgb(0x4C, 0x9B, 0xE8));
+        draw_folder_icon(ui, rect, Color32::from_rgb(0x4C, 0x9B, 0xE8));
     } else {
-        let body = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 1.0, rect.top()),
-            egui::pos2(rect.right() - 1.0, rect.bottom()),
-        );
-        p.rect_filled(body, 1.0, Color32::from_rgb(0xC8, 0xD0, 0xD8));
+        Icon::File.paint_at(ui, rect, Color32::from_rgb(0xA8, 0xB2, 0xBC));
     }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1043,15 @@ fn fm_drag_drop(ui: &mut egui::Ui, fm: &mut FileManager) {
 // 传输列表
 // ---------------------------------------------------------------------------
 
+fn transfer_progress_text(transfer: &crate::file_manager::Transfer) -> String {
+    let amount = if transfer.total == 0 {
+        fmt_bytes(transfer.done)
+    } else {
+        format!("{}/{}", fmt_bytes(transfer.done), fmt_bytes(transfer.total))
+    };
+    format!("{amount} · {}/s", fmt_rate(transfer.speed_bps()))
+}
+
 fn fm_transfers(ui: &mut egui::Ui, fm: &mut FileManager, max_height: f32, pos: TransferPos) {
     if fm.transfers.is_empty() {
         return;
@@ -918,86 +1078,150 @@ fn fm_transfers(ui: &mut egui::Ui, fm: &mut FileManager, max_height: f32, pos: T
                     clear_finished = true;
                 }
             });
-            for t in &fm.transfers {
-                if compact {
-                    // 右侧窄窗:文件名 + 细条进度
-                    ui.horizontal(|ui| {
-                        ui.label(match t.op {
-                            "download" | "download_dir" => "⇩",
-                            _ => "⇧",
-                        });
-                        ui.add(
-                            egui::Label::new(RichText::new(short_name(&t.path)).small()).truncate(),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(if let Some(err) = &t.error {
-                                RichText::new(format!("失败:{err}"))
-                                    .color(Color32::from_rgb(0xD8, 0x3A, 0x3A))
-                                    .small()
-                            } else if t.finished {
-                                RichText::new("完成")
-                                    .color(Color32::from_rgb(0x35, 0xA8, 0x60))
-                                    .small()
-                            } else {
-                                RichText::new(format!(
-                                    "{}/{}",
-                                    fmt_bytes(t.done),
-                                    fmt_bytes(t.total)
-                                ))
-                                .small()
+            let mut cancel_transfer = None;
+            let mut toggle_pause = None;
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height((max_height - 30.0).max(20.0))
+                .show(ui, |ui| {
+                    for t in &fm.transfers {
+                        if compact {
+                            // 右侧窄窗:文件名 + 细条进度
+                            ui.horizontal(|ui| {
+                                let transfer_icon = if matches!(t.op, "download" | "download_dir") {
+                                    Icon::Download
+                                } else {
+                                    Icon::Upload
+                                };
+                                ui.add(transfer_icon.image(13.0, ui.visuals().weak_text_color()));
+                                ui.add(
+                                    egui::Label::new(RichText::new(short_name(&t.path)).small())
+                                        .truncate(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if !t.finished {
+                                            if ui
+                                                .add(
+                                                    egui::Button::image(
+                                                        Icon::X
+                                                            .image(11.0, ui.visuals().text_color()),
+                                                    )
+                                                    .small(),
+                                                )
+                                                .on_hover_text("取消传输")
+                                                .clicked()
+                                            {
+                                                cancel_transfer = Some(t.id);
+                                            }
+                                            let pause_icon =
+                                                if t.paused { Icon::Play } else { Icon::Pause };
+                                            if ui
+                                                .add(
+                                                    egui::Button::image(
+                                                        pause_icon
+                                                            .image(11.0, ui.visuals().text_color()),
+                                                    )
+                                                    .small(),
+                                                )
+                                                .on_hover_text(if t.paused {
+                                                    "继续传输"
+                                                } else {
+                                                    "暂停传输"
+                                                })
+                                                .clicked()
+                                            {
+                                                toggle_pause = Some(t.id);
+                                            }
+                                        }
+                                        ui.label(if let Some(err) = &t.error {
+                                            RichText::new(format!("失败:{err}"))
+                                                .color(Color32::from_rgb(0xD8, 0x3A, 0x3A))
+                                                .small()
+                                        } else if t.finished {
+                                            RichText::new("完成")
+                                                .color(Color32::from_rgb(0x35, 0xA8, 0x60))
+                                                .small()
+                                        } else if t.paused {
+                                            RichText::new("已暂停").small()
+                                        } else {
+                                            RichText::new(transfer_progress_text(t)).small()
+                                        });
+                                    },
+                                );
                             });
-                        });
-                    });
-                    if !t.finished && t.total > 0 {
-                        let frac = (t.done as f32 / t.total as f32).clamp(0.0, 1.0);
-                        let bar_h = 3.0;
-                        let (rect, _) = ui.allocate_exact_size(
-                            vec2(ui.available_width(), bar_h),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter()
-                            .rect_filled(rect, 0.0, Color32::from_rgb(0xDD, 0xDD, 0xD8));
-                        let fill_w = rect.width() * frac;
-                        ui.painter().rect_filled(
-                            egui::Rect::from_min_size(rect.min, vec2(fill_w, bar_h)),
-                            0.0,
-                            Color32::from_rgb(0x4C, 0x9B, 0xE8),
-                        );
-                    }
-                } else {
-                    // 底部宽窗:横向 ProgressBar
-                    ui.horizontal(|ui| {
-                        ui.label(match t.op {
-                            "download" | "download_dir" => "⇩",
-                            _ => "⇧",
-                        });
-                        ui.add_sized(
-                            [200.0, 16.0],
-                            egui::Label::new(short_name(&t.path)).truncate(),
-                        );
-                        let frac = if t.total > 0 {
-                            (t.done as f32 / t.total as f32).clamp(0.0, 1.0)
+                            if !t.finished && t.total > 0 {
+                                let frac = (t.done as f32 / t.total as f32).clamp(0.0, 1.0);
+                                let bar_h = 3.0;
+                                let (rect, _) = ui.allocate_exact_size(
+                                    vec2(ui.available_width(), bar_h),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    Color32::from_rgb(0xDD, 0xDD, 0xD8),
+                                );
+                                let fill_w = rect.width() * frac;
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_size(rect.min, vec2(fill_w, bar_h)),
+                                    0.0,
+                                    Color32::from_rgb(0x4C, 0x9B, 0xE8),
+                                );
+                            }
                         } else {
-                            0.0
-                        };
-                        if !t.finished {
-                            ui.add_sized(
-                                [140.0, 12.0],
-                                egui::ProgressBar::new(frac).show_percentage(),
-                            );
+                            // 底部宽窗:横向 ProgressBar
+                            ui.horizontal(|ui| {
+                                ui.label(match t.op {
+                                    "download" | "download_dir" => "⇩",
+                                    _ => "⇧",
+                                });
+                                ui.add_sized(
+                                    [200.0, 16.0],
+                                    egui::Label::new(short_name(&t.path)).truncate(),
+                                );
+                                let frac = if t.total > 0 {
+                                    (t.done as f32 / t.total as f32).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                };
+                                if !t.finished {
+                                    ui.add_sized(
+                                        [140.0, 12.0],
+                                        egui::ProgressBar::new(frac).show_percentage(),
+                                    );
+                                }
+                                ui.label(if let Some(err) = &t.error {
+                                    RichText::new(format!("失败:{err}"))
+                                        .color(Color32::from_rgb(0xD8, 0x3A, 0x3A))
+                                } else if t.finished {
+                                    RichText::new("完成").color(Color32::from_rgb(0x35, 0xA8, 0x60))
+                                } else if t.paused {
+                                    RichText::new("已暂停")
+                                } else {
+                                    RichText::new(transfer_progress_text(t))
+                                });
+                                if !t.finished {
+                                    if ui
+                                        .small_button(if t.paused { "继续" } else { "暂停" })
+                                        .clicked()
+                                    {
+                                        toggle_pause = Some(t.id);
+                                    }
+                                    if ui.small_button("取消").clicked() {
+                                        cancel_transfer = Some(t.id);
+                                    }
+                                }
+                            });
                         }
-                        ui.label(if let Some(err) = &t.error {
-                            RichText::new(format!("失败:{err}"))
-                                .color(Color32::from_rgb(0xD8, 0x3A, 0x3A))
-                        } else if t.finished {
-                            RichText::new("完成").color(Color32::from_rgb(0x35, 0xA8, 0x60))
-                        } else if t.total == 0 {
-                            RichText::new(fmt_bytes(t.done))
-                        } else {
-                            RichText::new(format!("{}/{}", fmt_bytes(t.done), fmt_bytes(t.total)))
-                        });
-                    });
-                }
+                    }
+                });
+            if let Some(id) = toggle_pause {
+                fm.toggle_pause_transfer(id);
+            }
+            if let Some(id) = cancel_transfer {
+                fm.cancel_transfer(id);
             }
             if clear_finished {
                 fm.transfers.retain(|t| !t.finished);
@@ -1222,6 +1446,7 @@ fn fm_dialogs(ui: &mut egui::Ui, fm: &mut FileManager) {
 mod tests {
     use super::*;
     use crate::file_manager::FileManager;
+    use egui_kittest::kittest::Queryable;
 
     fn entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
         FileEntry {
@@ -1236,6 +1461,72 @@ mod tests {
             group: "root".into(),
             is_symlink: false,
         }
+    }
+
+    #[test]
+    fn file_name_text_uses_row_click_action() {
+        let mut fm = FileManager::new(None);
+        fm.cwd = "/tmp".into();
+        fm.entries = vec![entry("notes.txt", false, 2048)];
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 180.0))
+            .build_ui_state(
+                |ui, fm: &mut FileManager| {
+                    fm_table(ui, fm, &TransferSettings::default());
+                },
+                fm,
+            );
+
+        let pointer_pos = {
+            let node = harness.get_by_label("notes.txt");
+            node.hover();
+            node.rect().center()
+        };
+        harness.run();
+        assert_eq!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::Default
+        );
+
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: pointer_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run();
+        assert_eq!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::Default
+        );
+
+        harness.input_mut().events.push(egui::Event::PointerButton {
+            pos: pointer_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        harness.run();
+        assert_eq!(harness.state().selected, Some(0));
+
+        harness.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        harness.step();
+        assert!(
+            harness
+                .output()
+                .platform_output
+                .commands
+                .contains(&egui::OutputCommand::CopyText("/tmp/notes.txt".into())),
+            "active={}, commands={:?}",
+            harness.state().table_keyboard_active,
+            harness.output().platform_output.commands
+        );
     }
 
     /// 离屏渲染文件面板,输出 /tmp/rshell_fm.png 供人工检查布局
@@ -1265,11 +1556,11 @@ mod tests {
         let mut harness = egui_kittest::Harness::new_ui_state(
             |ui, fm: &mut FileManager| {
                 egui::Panel::bottom("fm").show(ui, |ui| {
-                    fm_toolbar(ui, fm);
+                    fm_toolbar(ui, fm, &TransferSettings::default());
                     ui.separator();
                     let transfers_h = transfers_height(fm, TransferPos::Bottom);
                     let body_h = (ui.available_height() - transfers_h).max(40.0);
-                    fm_body(ui, fm, body_h);
+                    fm_body(ui, fm, body_h, &TransferSettings::default());
                     fm_transfers(ui, fm, transfers_h, TransferPos::Bottom);
                 });
             },
@@ -1305,12 +1596,12 @@ mod tests {
                                 ui.label("文件 命令");
                             });
                             ui.separator();
-                            fm_toolbar(ui, fm);
+                            fm_toolbar(ui, fm, &TransferSettings::default());
                             ui.separator();
                             let body_h = (ui.available_height()
                                 - transfers_height(fm, TransferPos::Bottom))
                             .max(40.0);
-                            fm_body(ui, fm, body_h);
+                            fm_body(ui, fm, body_h, &TransferSettings::default());
                         });
                 },
                 fm,

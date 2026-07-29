@@ -1,12 +1,13 @@
 use crate::app::RShellApp;
-use egui::{Align2, Color32, CursorIcon, FontId, Pos2, RichText, Sense, Stroke, StrokeKind, vec2};
+use crate::ui::icons::{Icon, icon_button};
+use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Sense, Stroke, StrokeKind, vec2};
 
 impl RShellApp {
     pub(crate) fn show_tab_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::top("tab_bar").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                // 连接库(自绘图书图标)
+                // 连接库
                 if book_button(ui).clicked() {
                     self.show_library = !self.show_library;
                 }
@@ -78,11 +79,9 @@ impl RShellApp {
                     } else {
                         text_color
                     };
-                    ui.painter().text(
-                        x_rect.center(),
-                        Align2::CENTER_CENTER,
-                        "×",
-                        FontId::proportional(13.0),
+                    Icon::X.paint_at(
+                        ui,
+                        egui::Rect::from_center_size(x_rect.center(), vec2(11.0, 11.0)),
                         x_color,
                     );
                     if x_clicked
@@ -117,10 +116,13 @@ impl RShellApp {
                 }
                 // 设置按钮(右侧)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let resp = ui.add(
-                        egui::Button::new(RichText::new("⚙").size(15.0))
-                            .frame(false)
-                            .min_size(egui::vec2(22.0, 22.0)),
+                    let resp = icon_button(
+                        ui,
+                        Icon::Settings,
+                        "设置",
+                        vec2(22.0, 22.0),
+                        15.0,
+                        ui.visuals().text_color(),
                     );
                     if resp.clicked() {
                         self.show_settings = !self.show_settings;
@@ -137,73 +139,23 @@ impl RShellApp {
 
 /// 新建 SSH：尺寸、透明背景和悬停效果与连接库图标保持一致。
 fn new_ssh_button(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(22.0, 20.0), Sense::click());
-    let response = response
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text("新建 SSH 标签");
-    if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
-    }
-    let color = if response.hovered() {
-        ui.visuals().strong_text_color()
-    } else {
-        ui.visuals().weak_text_color()
-    };
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        "＋",
-        FontId::proportional(15.0),
-        color,
-    );
-    response
+    icon_button(
+        ui,
+        Icon::Plus,
+        "新建 SSH 标签",
+        vec2(22.0, 20.0),
+        15.0,
+        ui.visuals().weak_text_color(),
+    )
 }
 
-/// 自绘图书图标按钮(连接库)
 fn book_button(ui: &mut egui::Ui) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 20.0), Sense::click());
-    let resp = resp
-        .on_hover_cursor(CursorIcon::PointingHand)
-        .on_hover_text("连接库");
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
-    }
-    let color = if resp.hovered() {
-        ui.visuals().strong_text_color()
-    } else {
-        ui.visuals().weak_text_color()
-    };
-    let stroke = Stroke::new(1.5, color);
-    let book = egui::Rect::from_min_max(
-        Pos2::new(rect.left() + 4.0, rect.top() + 4.0),
-        Pos2::new(rect.right() - 4.0, rect.bottom() - 4.0),
-    );
-    let p = ui.painter();
-    // 书封
-    p.rect_stroke(
-        book,
-        egui::CornerRadius::same(2),
-        stroke,
-        StrokeKind::Outside,
-    );
-    // 书脊
-    p.vline(book.center().x, book.y_range(), stroke);
-    // 左页两条线
-    p.line_segment(
-        [
-            Pos2::new(book.left() + 2.0, book.top() + 3.0),
-            Pos2::new(book.center().x - 1.5, book.top() + 3.0),
-        ],
-        stroke,
-    );
-    p.line_segment(
-        [
-            Pos2::new(book.left() + 2.0, book.top() + 6.0),
-            Pos2::new(book.center().x - 1.5, book.top() + 6.0),
-        ],
-        stroke,
-    );
-    resp
+    icon_button(
+        ui,
+        Icon::BookOpen,
+        "连接库",
+        vec2(22.0, 20.0),
+        15.0,
+        ui.visuals().weak_text_color(),
+    )
 }

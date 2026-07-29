@@ -1,5 +1,16 @@
 use crate::app::RShellApp;
 use crate::config::TerminalBackgroundKind;
+use crate::ui::icons::{Icon, icon_button};
+
+fn no_term_alloc_debug() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var_os("RSHELL_NO_TERMALLOC").is_some())
+}
+
+fn no_cmd_bar_debug() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| std::env::var_os("RSHELL_NO_CMDBAR").is_some())
+}
 use crate::term_view::TermBackground;
 use egui::{Color32, RichText};
 
@@ -52,7 +63,7 @@ impl RShellApp {
                 let term_h = (ui.available_height() - bar_h).max(0.0);
                 let w = ui.available_width();
 
-                if std::env::var_os("RSHELL_NO_TERMALLOC").is_none() {
+                if !no_term_alloc_debug() {
                     ui.allocate_ui(egui::vec2(w, term_h), |ui| {
                         let idx = self.active;
                         if let Some(session) = self.sessions.get_mut(idx) {
@@ -87,7 +98,7 @@ impl RShellApp {
                     });
                 }
 
-                if std::env::var_os("RSHELL_NO_CMDBAR").is_none() {
+                if !no_cmd_bar_debug() {
                     self.show_cmd_bar(ui);
                 }
             });
@@ -102,45 +113,71 @@ impl RShellApp {
             return;
         }
 
-        let path = config.image_path.trim();
+        let path = config.image_path.trim().to_owned();
+        if self.terminal_background_load_attempt.as_deref() != Some(path.as_str()) {
+            self.terminal_background_rx = None;
+        }
+        if let Some(rx) = &self.terminal_background_rx {
+            match rx.try_recv() {
+                Ok((loaded_path, result)) => {
+                    self.terminal_background_rx = None;
+                    if loaded_path == path {
+                        match result {
+                            Ok(image) => {
+                                let handle = ctx.load_texture(
+                                    format!("terminal-background:{path}"),
+                                    image,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                self.terminal_background_texture =
+                                    Some(crate::app::TerminalBackgroundTexture {
+                                        path: path.clone(),
+                                        handle,
+                                    });
+                                self.terminal_background_error = None;
+                            }
+                            Err(error) => self.terminal_background_error = Some(error),
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.terminal_background_rx = None;
+                    self.terminal_background_error = Some("背景图片加载线程意外退出".to_string());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if self
             .terminal_background_texture
             .as_ref()
             .is_some_and(|cached| cached.path == path)
-            || self.terminal_background_load_attempt.as_deref() == Some(path)
+            || self.terminal_background_load_attempt.as_deref() == Some(path.as_str())
         {
             return;
         }
 
         self.terminal_background_texture = None;
-        self.terminal_background_load_attempt = Some(path.to_owned());
-        let result = (|| -> Result<egui::TextureHandle, String> {
-            let bytes =
-                std::fs::read(path).map_err(|error| format!("读取背景图片失败：{error}"))?;
-            let decoded = image::load_from_memory(&bytes)
-                .map_err(|error| format!("解析背景图片失败：{error}"))?;
-            let rgba = decoded.to_rgba8();
-            let size = [rgba.width() as usize, rgba.height() as usize];
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-            Ok(ctx.load_texture(
-                format!("terminal-background:{path}"),
-                color_image,
-                egui::TextureOptions::LINEAR,
-            ))
-        })();
-
-        match result {
-            Ok(handle) => {
-                self.terminal_background_texture = Some(crate::app::TerminalBackgroundTexture {
-                    path: path.to_owned(),
-                    handle,
-                });
-                self.terminal_background_error = None;
-            }
-            Err(error) => {
-                self.terminal_background_error = Some(error);
-            }
-        }
+        self.terminal_background_load_attempt = Some(path.clone());
+        self.terminal_background_error = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.terminal_background_rx = Some(rx);
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let bytes =
+                    std::fs::read(&path).map_err(|error| format!("读取背景图片失败：{error}"))?;
+                let decoded = image::load_from_memory(&bytes)
+                    .map_err(|error| format!("解析背景图片失败：{error}"))?;
+                let rgba = decoded.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                Ok(egui::ColorImage::from_rgba_unmultiplied(
+                    size,
+                    rgba.as_raw(),
+                ))
+            })();
+            let _ = tx.send((path, result));
+            repaint.request_repaint();
+        });
     }
 
     /// 命令输入条:回车发送到当前终端,↑↓ 翻阅历史,历史按钮弹出菜单
@@ -221,16 +258,22 @@ impl RShellApp {
                     .sessions
                     .get(self.active)
                     .is_some_and(|s| s.kind == crate::app::SessionKind::Ssh);
-                let mut btn =
-                    egui::Button::new(RichText::new("⚙").size(15.0).color(egui::Color32::WHITE));
-                if editable {
-                    btn = btn.fill(egui::Color32::TRANSPARENT);
-                }
-                let resp = ui.add(btn).on_hover_text(if editable {
-                    "连接设置"
-                } else {
-                    "本机会话无连接设置"
-                });
+                let resp = icon_button(
+                    ui,
+                    Icon::Settings,
+                    if editable {
+                        "连接设置"
+                    } else {
+                        "本机会话无连接设置"
+                    },
+                    egui::vec2(22.0, 20.0),
+                    15.0,
+                    if editable {
+                        egui::Color32::WHITE
+                    } else {
+                        ui.visuals().weak_text_color()
+                    },
+                );
                 if resp.clicked() && editable {
                     self.open_session_edit();
                 }
@@ -239,12 +282,16 @@ impl RShellApp {
             // 断开/失败后显示循环箭头(点击重连)
             if let Some(session) = self.sessions.get(self.active) {
                 let connected = session.is_connected();
-                let (icon, tip) = if connected {
-                    (ConnIcon::Power, "断开连接")
+                let (icon, tip, color) = if connected {
+                    (Icon::Power, "断开连接", Color32::from_rgb(0xE8, 0x4C, 0x3D))
                 } else {
-                    (ConnIcon::Reconnect, "重新连接")
+                    (
+                        Icon::RefreshCw,
+                        "重新连接",
+                        Color32::from_rgb(0x35, 0xC4, 0x50),
+                    )
                 };
-                if conn_icon_button(ui, icon, tip).clicked() {
+                if icon_button(ui, icon, tip, egui::vec2(22.0, 20.0), 15.0, color).clicked() {
                     let ctx = ui.ctx().clone();
                     let session = &mut self.sessions[self.active];
                     if connected {
@@ -291,78 +338,6 @@ fn history_down(
         *index = None;
         *input = draft.take().unwrap_or_default();
     }
-}
-
-/// 连接状态图标种类
-#[derive(Clone, Copy)]
-enum ConnIcon {
-    /// 循环箭头:重新连接
-    Reconnect,
-    /// 电源符号:断开连接
-    Power,
-}
-
-/// 画出来的小图标按钮(egui 内置字体缺这类字形,不用文本符号)
-fn conn_icon_button(ui: &mut egui::Ui, icon: ConnIcon, tip: &str) -> egui::Response {
-    use egui::{Color32, Pos2, Stroke, vec2};
-    let (rect, resp) = ui.allocate_exact_size(vec2(22.0, 20.0), egui::Sense::click());
-    let resp = resp
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text(tip);
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, 3.0, ui.visuals().widgets.hovered.bg_fill);
-    }
-    let color = match icon {
-        // 语义色:重连绿、断开红;悬停时提亮
-        ConnIcon::Reconnect => Color32::from_rgb(0x35, 0xC4, 0x50),
-        ConnIcon::Power => Color32::from_rgb(0xE8, 0x4C, 0x3D),
-    };
-    let color = if resp.hovered() {
-        color.gamma_multiply(1.35)
-    } else {
-        color
-    };
-    let c = rect.center();
-    let r = 6.0;
-    let stroke = Stroke::new(1.5, color);
-    // 圆弧点列:角度制,y 向下,角度增大=顺时针
-    let arc = |from: f32, to: f32| -> Vec<Pos2> {
-        (0..=24)
-            .map(|i| {
-                let a = (from + (to - from) * i as f32 / 24.0).to_radians();
-                c + vec2(a.cos() * r, a.sin() * r)
-            })
-            .collect()
-    };
-    match icon {
-        ConnIcon::Reconnect => {
-            // 300° 圆弧 + 末端箭头
-            let pts = arc(60.0, 360.0);
-            ui.painter().add(egui::Shape::line(pts.clone(), stroke));
-            let tip_p = *pts.last().unwrap();
-            let prev = pts[pts.len() - 2];
-            let d = (tip_p - prev).normalized();
-            let n = vec2(-d.y, d.x);
-            ui.painter().add(egui::Shape::convex_polygon(
-                vec![
-                    tip_p + d * 2.0,
-                    tip_p - d * 4.0 + n * 3.0,
-                    tip_p - d * 4.0 - n * 3.0,
-                ],
-                color,
-                Stroke::NONE,
-            ));
-        }
-        ConnIcon::Power => {
-            // 顶部留缺口的圆弧 + 顶部竖线
-            ui.painter()
-                .add(egui::Shape::line(arc(-40.0, 220.0), stroke));
-            ui.painter()
-                .line_segment([c + vec2(0.0, -r - 1.5), c + vec2(0.0, -r * 0.15)], stroke);
-        }
-    }
-    resp
 }
 
 #[cfg(test)]
