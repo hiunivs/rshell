@@ -8,6 +8,7 @@ use crate::file_kind::FileKind;
 use crate::session::files::{FileEntry, SftpCmd};
 use crate::ui::sidebar::fmt_bytes;
 use egui::{Color32, RichText, vec2};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 内容探测字节数(层级 4 嗅探只需要文件头)
@@ -130,9 +131,12 @@ pub struct EditorDoc {
     pub text_gen: u64,
     /// 是否包含尚未保存的修改。
     pub dirty: bool,
+    /// 最近一次确认写入成功的内容基线；不保留完整副本，避免文档内存翻倍。
+    saved_len: usize,
+    saved_digest: [u8; 32],
     text_len: usize,
     /// 进行中的保存(WriteFile 操作 ID)
-    pub saving: Option<u64>,
+    saving: Option<PendingSave>,
     /// 保存完成后自动关闭标签("保存并关闭")
     pub close_after_save: bool,
     pub error: Option<String>,
@@ -153,6 +157,12 @@ struct EditorChunk {
     lines: usize,
     /// 自动换行模式下的已测量高度；只缓存数值，不保留 Galley。
     wrap_height: Option<WrapHeightCache>,
+}
+
+struct PendingSave {
+    id: u64,
+    len: usize,
+    digest: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -189,6 +199,7 @@ impl EditorDoc {
         let line_count = line_count(&text);
         let text_len = text.len();
         let chunks = chunk_text(text);
+        let saved_digest = digest_chunks(&chunks);
         Self {
             session_id,
             host_label: String::new(),
@@ -197,6 +208,8 @@ impl EditorDoc {
             chunks,
             text_gen: 0,
             dirty: false,
+            saved_len: text_len,
+            saved_digest,
             text_len,
             saving: None,
             close_after_save: false,
@@ -216,13 +229,22 @@ impl EditorDoc {
     fn mark_text_changed(&mut self) {
         self.text_gen = self.text_gen.wrapping_add(1);
         self.recount();
-        // 输入时不再每键扫描/哈希整篇文件。长度相同的“改回原文”在保存时重新建立基准。
-        self.dirty = true;
+        self.refresh_dirty();
     }
 
-    /// 保存成功:以当前内容为新的脏检测基准
-    fn mark_saved(&mut self) {
-        self.dirty = false;
+    /// 保存成功：以实际发送的快照为新基线。若保存期间又发生编辑，当前内容仍会
+    /// 与该快照比较，不会被完成事件错误地标记为已保存。
+    fn mark_saved(&mut self, len: usize, digest: [u8; 32]) {
+        self.saved_len = len;
+        self.saved_digest = digest;
+        self.refresh_dirty();
+    }
+
+    fn refresh_dirty(&mut self) {
+        // 绝大多数输入会先改变长度，此时 O(1) 即可判脏。只有长度重新等于保存
+        // 基线（撤销、删回原文、等长替换）时才扫描分块计算摘要。
+        self.dirty =
+            self.text_len != self.saved_len || digest_chunks(&self.chunks) != self.saved_digest;
     }
 
     fn full_text(&self) -> String {
@@ -323,6 +345,17 @@ fn chunk_text(text: String) -> Vec<EditorChunk> {
 fn line_count(text: &str) -> usize {
     let n = text.lines().count();
     (n + usize::from(text.ends_with('\n'))).max(1)
+}
+
+fn digest_chunks(chunks: &[EditorChunk]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        if index > 0 {
+            digest.update(b"\n");
+        }
+        digest.update(chunk.text.as_bytes());
+    }
+    digest.finalize().into()
 }
 
 /// 搜索匹配(字节区间);大小写不敏感用整体小写化实现(常见代码/配置文本足够准确)
@@ -700,15 +733,20 @@ impl RShellApp {
     }
 
     fn on_write_done(&mut self, id: u64, result: Result<(), String>) {
-        let Some(doc_idx) = self.editor.docs.iter().position(|d| d.saving == Some(id)) else {
+        let Some(doc_idx) = self
+            .editor
+            .docs
+            .iter()
+            .position(|doc| doc.saving.as_ref().is_some_and(|saving| saving.id == id))
+        else {
             return;
         };
         let doc = &mut self.editor.docs[doc_idx];
-        doc.saving = None;
+        let saving = doc.saving.take().expect("matching save checked");
         let close_after = doc.close_after_save;
         match result {
             Ok(()) => {
-                doc.mark_saved();
+                doc.mark_saved(saving.len, saving.digest);
                 doc.close_after_save = false;
             }
             Err(e) => {
@@ -733,14 +771,17 @@ impl RShellApp {
         let fm = &mut self.sessions[idx].fm;
         let id = fm.next_op_id();
         let doc = &mut self.editor.docs[doc_idx];
+        let data = doc.full_text().into_bytes();
+        let len = data.len();
+        let digest: [u8; 32] = Sha256::digest(&data).into();
         let result = fm.send(SftpCmd::WriteFile {
             id,
             path: doc.path.clone(),
-            data: doc.full_text().into_bytes(),
+            data,
         });
         match result {
             Ok(()) => {
-                doc.saving = Some(id);
+                doc.saving = Some(PendingSave { id, len, digest });
                 doc.error = None;
             }
             Err(e) => doc.error = Some(format!("保存失败:{e}")),
@@ -2267,6 +2308,34 @@ mod tests {
             assert_eq!(doc.full_text(), text);
             assert_eq!(doc.line_count(), line_count(text));
         }
+    }
+
+    #[test]
+    fn dirty_state_clears_when_content_returns_to_saved_baseline() {
+        let mut doc = EditorDoc::new(1, "/tmp/a".into(), "a.txt".into(), "original".into(), false);
+
+        doc.replace_full_text("changed".into());
+        assert!(doc.dirty);
+        doc.replace_full_text("original".into());
+        assert!(!doc.dirty);
+
+        doc.replace_full_text("OriginaL".into());
+        assert!(doc.dirty, "等长但内容不同仍必须判定为脏");
+    }
+
+    #[test]
+    fn save_completion_keeps_edits_made_after_save_started_dirty() {
+        let mut doc = EditorDoc::new(1, "/tmp/a".into(), "a.txt".into(), "old".into(), false);
+        doc.replace_full_text("snapshot".into());
+        let saved_len = doc.text_len;
+        let saved_digest = digest_chunks(&doc.chunks);
+
+        doc.replace_full_text("newer edit".into());
+        doc.mark_saved(saved_len, saved_digest);
+        assert!(doc.dirty);
+
+        doc.replace_full_text("snapshot".into());
+        assert!(!doc.dirty);
     }
 
     #[test]
