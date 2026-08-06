@@ -256,7 +256,7 @@ fn usage_color(frac: f32) -> Color32 {
 /// 同步状态 / IP
 fn sidebar_status(ui: &mut egui::Ui, host: &str, has_data: bool) {
     ui.horizontal(|ui| {
-        ui.label("同步状态");
+        ui.label("状态");
         ui.label(RichText::new("●").color(if has_data {
             Color32::from_rgb(0x35, 0xC4, 0x50)
         } else {
@@ -426,6 +426,11 @@ pub fn top_procs(m: &SystemMetrics, sort: ProcSort) -> Vec<&crate::session::moni
     procs
 }
 
+fn process_text_label(text: impl Into<egui::WidgetText>) -> egui::Label {
+    // 可拖选文字，但悬停光标由调用处覆盖成箭头。
+    egui::Label::new(text).selectable(true)
+}
+
 /// 进程列表(内存/CPU/进程);进程列弹性宽,整行最小宽 ≈ 56+36+20+间距,
 /// 保证内容最小宽低于 SIDEBAR_W_MIN。
 /// 点击"内存"/"CPU"表头切换排序键,选中列高亮;始终显示该键的前 10 名
@@ -499,18 +504,24 @@ fn sidebar_processes(
                         .text_style_height(&egui::TextStyle::Body)
                         .ceil()
                         .max(14.0);
-                    ui.add_sized([56.0, row_h], egui::Label::new(fmt_kb(p.rss_kb)));
+                    ui.add_sized([56.0, row_h], process_text_label(fmt_kb(p.rss_kb)))
+                        .on_hover_cursor(egui::CursorIcon::Default);
                     ui.add_sized(
                         [36.0, row_h],
                         // 一位小数:0.3% 这类波动也能看到,整数会常年显示 0
-                        egui::Label::new(format!("{:.1}", p.cpu)),
-                    );
-                    ui.add_sized([cmd_w, row_h], egui::Label::new(&p.command).truncate());
+                        process_text_label(format!("{:.1}", p.cpu)),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::Default);
+                    ui.add_sized([cmd_w, row_h], process_text_label(&p.command).truncate())
+                        .on_hover_cursor(egui::CursorIcon::Default);
                 });
             }
         }
         _ => {
-            ui.label(RichText::new("（无数据）").small().weak());
+            ui.add(process_text_label(
+                RichText::new("（无数据）").small().weak(),
+            ))
+            .on_hover_cursor(egui::CursorIcon::Default);
         }
     }
 }
@@ -695,6 +706,7 @@ fn sidebar_disks(ui: &mut egui::Ui, m: Option<&SystemMetrics>) {
 mod tests {
     use super::*;
     use crate::session::monitor::{ProcInfo, SystemMetrics};
+    use egui_kittest::kittest::Queryable;
 
     fn procs(spec: &[(u64, f32, &str)]) -> SystemMetrics {
         SystemMetrics {
@@ -750,6 +762,39 @@ mod tests {
         );
         assert_eq!(top_procs(&m, ProcSort::Mem).len(), 10);
         assert_eq!(top_procs(&m, ProcSort::Cpu).len(), 10);
+    }
+
+    #[test]
+    fn process_text_uses_arrow_cursor() {
+        let metrics = procs(&[(1024, 0.5, "sshd")]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(220.0, 100.0))
+            .build_ui_state(
+                |ui, state: &mut (SystemMetrics, ProcSort)| {
+                    let (metrics, sort) = state;
+                    let rows = metrics.procs.clone();
+                    sidebar_processes(ui, Some(metrics), &rows, &rows, sort);
+                },
+                (metrics, ProcSort::Mem),
+            );
+
+        let command_rect = harness.get_by_label("sshd").rect();
+        harness.hover_at(command_rect.center());
+        harness.run();
+        assert_eq!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::Default
+        );
+    }
+
+    #[test]
+    fn process_text_remains_selectable() {
+        let ctx = egui::Context::default();
+        let mut senses_drag = false;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            senses_drag = ui.add(process_text_label("sshd")).sense.senses_drag();
+        });
+        assert!(senses_drag, "selectable process text should sense drags");
     }
 
     #[test]

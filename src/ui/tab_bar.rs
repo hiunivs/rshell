@@ -1,4 +1,4 @@
-use crate::app::RShellApp;
+use crate::app::{RShellApp, SessionKind};
 use crate::ui::icons::{Icon, icon_button};
 use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Sense, Stroke, StrokeKind, vec2};
 
@@ -20,13 +20,12 @@ impl RShellApp {
                 // 自绘标签块:[× 标题],选中标签高亮(同下方"文件｜命令"的
                 // selectable 风格),块之间用间隙分隔而非竖线
                 let mut close: Option<usize> = None;
+                let mut activate: Option<usize> = None;
                 let font = FontId::proportional(13.0);
                 for (i, session) in self.sessions.iter().enumerate() {
                     let title = session.title.clone();
-                    let middle_click_closes = matches!(
-                        session.kind,
-                        crate::app::SessionKind::Ssh | crate::app::SessionKind::Launcher
-                    );
+                    let middle_click_closes =
+                        matches!(session.kind, SessionKind::Ssh | SessionKind::Launcher);
                     let selected = i == self.active;
                     let text_color = if selected {
                         ui.visuals().strong_text_color()
@@ -100,10 +99,11 @@ impl RShellApp {
                     );
                     // 点击标签体(非 × 区)切换
                     if resp.clicked() && !x_clicked {
-                        self.active = i;
+                        activate = Some(i);
                     }
                     resp.on_hover_cursor(CursorIcon::PointingHand);
                 }
+                let mut refocus_terminal = false;
                 if let Some(i) = close {
                     self.sessions.remove(i);
                     if self.sessions.is_empty() {
@@ -113,6 +113,18 @@ impl RShellApp {
                     } else if self.active >= self.sessions.len() {
                         self.active = self.sessions.len().saturating_sub(1);
                     }
+                    refocus_terminal = true;
+                } else if let Some(i) = activate {
+                    self.active = i;
+                    refocus_terminal = true;
+                }
+                if refocus_terminal
+                    && let Some(term) = self
+                        .sessions
+                        .get_mut(self.active)
+                        .and_then(|session| session.term.as_mut())
+                {
+                    term.request_focus();
                 }
                 // 设置按钮(右侧)
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

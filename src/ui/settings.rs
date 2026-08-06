@@ -2,7 +2,7 @@ use crate::app::RShellApp;
 use crate::config::{
     ColorScheme, DEFAULT_TERMINAL_BACKGROUND_COLOR, DownloadPathMode, FileOpenMode,
     PasswordStorage, TERMINAL_BACKGROUND_PRESETS, TerminalBackgroundKind, TerminalImageMode,
-    ThemeMode,
+    ThemeMode, UpdateChannel,
 };
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, ThemePreference, Ui, vec2};
 
@@ -14,6 +14,7 @@ pub enum SettingsPage {
     Transfers,
     Editor,
     Shortcuts,
+    Updates,
     Help,
     About,
 }
@@ -26,6 +27,7 @@ impl SettingsPage {
             Self::Editor => "编辑器",
             Self::Security => "安全",
             Self::Shortcuts => "快捷设置",
+            Self::Updates => "软件更新",
             Self::Help => "帮助",
             Self::About => "关于",
         }
@@ -115,6 +117,7 @@ impl RShellApp {
                                         SettingsPage::Security,
                                         SettingsPage::Editor,
                                         SettingsPage::Shortcuts,
+                                        SettingsPage::Updates,
                                         SettingsPage::Help,
                                         SettingsPage::About,
                                     ] {
@@ -165,6 +168,11 @@ impl RShellApp {
                                                     ),
                                                 SettingsPage::Shortcuts => self
                                                     .show_shortcut_settings_page(
+                                                        ui,
+                                                        &mut config_changed,
+                                                    ),
+                                                SettingsPage::Updates => self
+                                                    .show_update_settings_page(
                                                         ui,
                                                         &mut config_changed,
                                                     ),
@@ -688,6 +696,104 @@ impl RShellApp {
                     }
                     ui.end_row();
                 });
+        });
+
+        self.show_settings_error(ui);
+    }
+
+    fn show_update_settings_page(&mut self, ui: &mut Ui, config_changed: &mut bool) {
+        settings_section_frame(ui).show(ui, |ui| {
+            ui.set_width(396.0);
+            ui.label(RichText::new("版本与更新").strong().size(14.0));
+            ui.add_space(9.0);
+
+            egui::Grid::new("software_update_settings_grid")
+                .num_columns(2)
+                .spacing([32.0, 14.0])
+                .show(ui, |ui| {
+                    settings_row_label(ui, "当前版本");
+                    ui.label(env!("CARGO_PKG_VERSION"));
+                    ui.end_row();
+
+                    settings_row_label(ui, "更新方式");
+                    ui.label(self.updater.platform_label());
+                    ui.end_row();
+
+                    settings_row_label(ui, "更新通道");
+                    let mut channel = self.config.updates.channel;
+                    egui::ComboBox::from_id_salt("software_update_channel")
+                        .selected_text(channel.label())
+                        .width(190.0)
+                        .show_ui(ui, |ui| {
+                            for option in [UpdateChannel::Stable, UpdateChannel::Beta] {
+                                ui.selectable_value(&mut channel, option, option.label());
+                            }
+                        });
+                    if channel != self.config.updates.channel {
+                        self.config.updates.channel = channel;
+                        if !self.updater.configure_channel(channel) {
+                            self.config.updates.automatic_checks = false;
+                        }
+                        *config_changed = true;
+                    }
+                    ui.end_row();
+
+                    if self.updater.manages_automatic_checks() {
+                        settings_row_label(ui, "自动检查");
+                        let mut automatic = self.config.updates.automatic_checks;
+                        let channel_available = self
+                            .updater
+                            .is_available(self.config.updates.channel);
+                        ui.add_enabled_ui(channel_available, |ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if settings_toggle(ui, &mut automatic).changed() {
+                                        self.config.updates.automatic_checks = automatic;
+                                        self.updater.set_automatic_checks(automatic);
+                                        *config_changed = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.end_row();
+                    }
+                });
+
+            ui.add_space(12.0);
+            let channel = self.config.updates.channel;
+            let enabled = self.updater.is_available(channel);
+            let response = ui.add_enabled(
+                enabled,
+                egui::Button::new("检查更新").min_size(vec2(112.0, 30.0)),
+            );
+            if response.clicked()
+                && let Ok(action) = self.updater.check_for_updates(channel)
+                && let crate::update::UpdateAction::OpenUrl(url) = action
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+            }
+
+            ui.add_space(9.0);
+            let status_color = if enabled {
+                ui.visuals().weak_text_color()
+            } else {
+                Color32::from_rgb(0xD9, 0x78, 0x32)
+            };
+            ui.label(
+                RichText::new(self.updater.status())
+                    .color(status_color)
+                    .small(),
+            );
+            ui.add_space(5.0);
+            let detail = if cfg!(target_os = "windows") {
+                "安装与回滚由 Windows App Installer 处理；自动检查周期由已签名的 .appinstaller 配置。"
+            } else if cfg!(target_os = "macos") {
+                "下载、签名验证与替换由内嵌 Sparkle 处理，RShell 不会自行覆盖程序文件。"
+            } else {
+                "当前平台没有配置原生更新后端。"
+            };
+            ui.label(RichText::new(detail).weak().small());
         });
 
         self.show_settings_error(ui);

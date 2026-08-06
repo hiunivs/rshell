@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AppInstaller
+    xmlns="http://schemas.microsoft.com/appx/appinstaller/2021"
+    Version="__VERSION__"
+    Uri="__APPINSTALLER_URL__">
+    <MainBundle
+        Name="__PACKAGE_NAME__"
+        Publisher="__PUBLISHER__"
+        Version="__VERSION__"
+        Uri="__BUNDLE_URL__" />
+    <UpdateSettings>
+        <OnLaunch HoursBetweenUpdateChecks="12" ShowPrompt="true" UpdateBlocksActivation="false" />
+    </UpdateSettings>
+</AppInstaller>

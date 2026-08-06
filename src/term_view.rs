@@ -43,6 +43,24 @@ struct BackgroundRun {
     color: Color32,
 }
 
+struct CachedTextRun {
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+    fg: Color32,
+    flags: Flags,
+    galley: std::sync::Arc<egui::Galley>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RenderCacheKey {
+    revision: u64,
+    font_size_bits: u32,
+    cell_width_bits: u32,
+    cell_height_bits: u32,
+    background: Color32,
+}
+
 fn paint_terminal_background(painter: &egui::Painter, rect: Rect, background: &TermBackground) {
     painter.rect_filled(rect, 0.0, background.color);
 
@@ -271,9 +289,9 @@ impl EventListener for EventProxy {
                     let _ = tx.send(SessionCmd::Input(s.into_bytes()));
                 }
             }
-            Event::Wakeup | Event::CursorBlinkingChange | Event::MouseCursorDirty => {
-                self.ctx.request_repaint();
-            }
+            // 这些事件全部发生在 UI 正在处理的数据解析、尺寸调整或鼠标操作
+            // 过程中；对应路径已经显式标记缓存失效。再次唤醒只会多画一帧。
+            Event::Wakeup | Event::CursorBlinkingChange | Event::MouseCursorDirty => {}
             Event::ClipboardStore(_, text) => self.ctx.copy_text(text),
             _ => {}
         }
@@ -292,7 +310,7 @@ pub struct TermView {
     proxy_tx: std::sync::Arc<std::sync::Mutex<CmdTx>>,
     data_rx: DataRx,
     event_rx: Receiver<SessionEvent>,
-    ctx: egui::Context,
+    monitor_active_tx: Option<tokio::sync::watch::Sender<bool>>,
     exited: bool,
     /// 手动断开置位:网格保留可读,不盖"进程已退出"遮罩
     manual_exit: bool,
@@ -313,7 +331,7 @@ pub struct TermView {
     /// 获得输入焦点后控制光标显示/隐藏的闪烁计时。
     cursor_blink_epoch: std::time::Instant,
     cursor_was_focused: bool,
-    /// 新建会话首次显示终端时请求一次输入焦点。
+    /// 新建会话首次显示或重新激活标签时，请求一次输入焦点。
     request_initial_focus: bool,
     /// poll() 收到的监控指标,等 app 层取走
     pending_metrics: Option<std::sync::Arc<SystemMetrics>>,
@@ -323,8 +341,13 @@ pub struct TermView {
     pending_hostkey: Vec<HostKeyPrompt>,
     /// 当前帧的文字 run；只复用 Vec 容量，不复用旧 run 内容和边界。
     render_runs: Vec<RenderRun>,
-    /// 当前帧的背景 run。与文字 run 分离，选区变化不会重新切分文字。
+    /// 缓存的背景 run。终端内容/选区未变化时直接复用。
     background_runs: Vec<BackgroundRun>,
+    /// 已完成字体布局的文字 run。光标闪烁时只克隆 Galley 引用，不重新
+    /// 拼接字符串或执行 shaping。
+    cached_text_runs: Vec<CachedTextRun>,
+    render_cache_key: Option<RenderCacheKey>,
+    render_revision: u64,
 }
 
 impl TermView {
@@ -334,7 +357,14 @@ impl TermView {
         dims: TermDims,
     ) -> anyhow::Result<(Self, session::files::SftpTx)> {
         let ch = session::local::spawn(dims.cols as u16, dims.rows as u16, ctx.clone())?;
-        let view = Self::with_channels(ctx, dims, ch.cmd_tx, ch.data_rx, ch.event_rx);
+        let view = Self::with_channels(
+            ctx,
+            dims,
+            ch.cmd_tx,
+            ch.data_rx,
+            ch.event_rx,
+            ch.monitor_active_tx,
+        );
         Ok((view, ch.sftp_tx))
     }
 
@@ -345,7 +375,14 @@ impl TermView {
         params: SshParams,
     ) -> (Self, session::files::SftpTx) {
         let ch = session::ssh::spawn(params, dims.cols as u16, dims.rows as u16, ctx.clone());
-        let view = Self::with_channels(ctx, dims, ch.cmd_tx, ch.data_rx, ch.event_rx);
+        let view = Self::with_channels(
+            ctx,
+            dims,
+            ch.cmd_tx,
+            ch.data_rx,
+            ch.event_rx,
+            ch.monitor_active_tx,
+        );
         (view, ch.sftp_tx)
     }
 
@@ -355,6 +392,7 @@ impl TermView {
         cmd_tx: CmdTx,
         data_rx: DataRx,
         event_rx: Receiver<SessionEvent>,
+        monitor_active_tx: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Self {
         let proxy_tx = std::sync::Arc::new(std::sync::Mutex::new(cmd_tx.clone()));
         let proxy = EventProxy {
@@ -369,7 +407,7 @@ impl TermView {
             proxy_tx,
             data_rx,
             event_rx,
-            ctx: ctx.clone(),
+            monitor_active_tx,
             exited: false,
             manual_exit: false,
             exit_overlay: None,
@@ -386,6 +424,9 @@ impl TermView {
             pending_hostkey: Vec::new(),
             render_runs: Vec::with_capacity(128),
             background_runs: Vec::with_capacity(64),
+            cached_text_runs: Vec::with_capacity(128),
+            render_cache_key: None,
+            render_revision: 0,
         }
     }
 
@@ -410,16 +451,19 @@ impl TermView {
         const MAX_PARSE_TIME: std::time::Duration = std::time::Duration::from_millis(4);
         let started = std::time::Instant::now();
         let mut parsed = 0usize;
+        let mut changed = false;
         while parsed < MAX_BYTES_PER_FRAME && started.elapsed() < MAX_PARSE_TIME {
             let Ok(data) = self.data_rx.try_recv() else {
                 break;
             };
             parsed += data.len();
             self.parser.advance(&mut self.term, &data);
+            changed = true;
         }
-        if !self.data_rx.is_empty() {
-            self.ctx.request_repaint();
+        if changed {
+            self.mark_render_dirty();
         }
+        self.data_rx.finish_poll();
     }
 
     /// 取走积压的监控指标
@@ -435,6 +479,29 @@ impl TermView {
     /// 取走积压的主机指纹确认请求
     pub fn take_hostkey(&mut self) -> Vec<HostKeyPrompt> {
         std::mem::take(&mut self.pending_hostkey)
+    }
+
+    /// 当前会话是否正在被主窗口/系统信息页展示。后台 SSH 标签暂停监控，
+    /// 状态不变时 watch 不会发送事件，也不会产生每帧通道开销。
+    pub fn set_monitor_active(&self, active: bool) {
+        if let Some(tx) = &self.monitor_active_tx {
+            tx.send_if_modified(|value| {
+                if *value == active {
+                    false
+                } else {
+                    *value = active;
+                    true
+                }
+            });
+        }
+    }
+
+    /// 下一次显示终端时把键盘/IME 焦点交给终端输入区域。
+    ///
+    /// 标签栏本身也是可点击控件，切换标签后需要显式把点击取得的焦点
+    /// 交回新激活的终端。
+    pub fn request_focus(&mut self) {
+        self.request_initial_focus = true;
     }
 
     /// 会话进程是否已退出/连接已断开(收到 Exited 或手动断开后置位)
@@ -469,6 +536,7 @@ impl TermView {
     pub fn feed_str(&mut self, s: &str) {
         let data = s.replace('\n', "\r\n").into_bytes();
         self.parser.advance(&mut self.term, &data);
+        self.mark_render_dirty();
     }
 
     /// 手动断开:通知会话线程关闭连接/杀掉子进程,网格内容保留,
@@ -481,13 +549,20 @@ impl TermView {
     }
 
     /// 复用现有网格重连:只换通道,滚回内容完整保留
-    pub fn reconnect(&mut self, cmd_tx: CmdTx, data_rx: DataRx, event_rx: Receiver<SessionEvent>) {
+    pub fn reconnect(
+        &mut self,
+        cmd_tx: CmdTx,
+        data_rx: DataRx,
+        event_rx: Receiver<SessionEvent>,
+        monitor_active_tx: Option<tokio::sync::watch::Sender<bool>>,
+    ) {
         if let Ok(mut guard) = self.proxy_tx.lock() {
             *guard = cmd_tx.clone();
         }
         self.cmd_tx = cmd_tx;
         self.data_rx = data_rx;
         self.event_rx = event_rx;
+        self.monitor_active_tx = monitor_active_tx;
         self.exited = false;
         self.manual_exit = false;
         self.exit_overlay = None;
@@ -501,6 +576,7 @@ impl TermView {
         }
         let _ = self.cmd_tx.send(SessionCmd::Input(s.as_bytes().to_vec()));
         self.term.scroll_display(Scroll::Bottom);
+        self.mark_render_dirty();
     }
 
     fn copy_selection(&mut self, ctx: &egui::Context) {
@@ -510,7 +586,13 @@ impl TermView {
             }
             self.term.selection = None;
             self.selection_copy_pos = None;
+            self.mark_render_dirty();
         }
+    }
+
+    fn mark_render_dirty(&mut self) {
+        self.render_revision = self.render_revision.wrapping_add(1);
+        self.render_cache_key = None;
     }
 
     fn has_selection(&self) -> bool {
@@ -553,7 +635,17 @@ impl TermView {
 
         let avail = ui.available_size();
         let (response, painter) = ui.allocate_painter(avail, egui::Sense::click_and_drag());
-        if self.request_initial_focus {
+        let window_has_focus = window_has_focus(ui);
+        let window_just_gained_focus = ui.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(true)))
+        });
+        let focus_is_unclaimed = ui.memory(|memory| memory.focused().is_none());
+        if window_has_focus
+            && (self.request_initial_focus || window_just_gained_focus || focus_is_unclaimed)
+        {
             response.request_focus();
             self.request_initial_focus = false;
         }
@@ -580,6 +672,7 @@ impl TermView {
                 self.pending_dims = None;
                 self.dims = dims;
                 self.term.resize(dims);
+                self.mark_render_dirty();
                 let _ = self.cmd_tx.send(SessionCmd::Resize {
                     cols: cols as u16,
                     rows: rows as u16,
@@ -646,14 +739,13 @@ impl TermView {
     }
 
     fn cursor_blink_visible(&mut self, ui: &egui::Ui, terminal_has_focus: bool) -> bool {
-        let window_has_focus = ui.input(|input| input.viewport().focused.unwrap_or(true));
-        let focused = terminal_has_focus && window_has_focus;
+        let focused = terminal_has_focus && window_has_focus(ui);
         if focused != self.cursor_was_focused {
             self.cursor_was_focused = focused;
             self.cursor_blink_epoch = std::time::Instant::now();
         }
         if !focused {
-            return true;
+            return false;
         }
 
         const PHASE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -679,6 +771,7 @@ impl TermView {
                 if lines != 0 {
                     self.scroll_acc -= lines as f32;
                     self.term.scroll_display(Scroll::Delta(lines));
+                    self.mark_render_dirty();
                     ui.ctx().request_repaint();
                 }
             }
@@ -699,119 +792,128 @@ impl TermView {
     ) {
         let cell_w = cell_size.x;
         let cell_h = cell_size.y;
-        let content = self.term.renderable_content();
-        let display_offset = content.display_offset;
-        let colors = content.colors;
-        let cursor_vp = term::point_to_viewport(display_offset, content.cursor.point);
-        let cursor_visible = cursor_blink_visible && content.cursor.shape != CursorShape::Hidden;
+        let cache_key = RenderCacheKey {
+            revision: self.render_revision,
+            font_size_bits: font.size.to_bits(),
+            cell_width_bits: cell_w.to_bits(),
+            cell_height_bits: cell_h.to_bits(),
+            background: background_color,
+        };
 
-        // 背景与文字使用不同的 run。选区只会切分背景，不会改变文字 shaping
-        // 的边界，避免缩进、宽字符或字体回退在拖选时发生位移和重绘叠加。
-        self.render_runs.clear();
-        self.background_runs.clear();
-        let runs = &mut self.render_runs;
-        let backgrounds = &mut self.background_runs;
+        if self.render_cache_key != Some(cache_key) {
+            let content = self.term.renderable_content();
+            let display_offset = content.display_offset;
+            let colors = content.colors;
 
-        for indexed in content.display_iter {
-            let point = indexed.point;
-            let cell = indexed.cell;
-            let row = (point.line.0 + display_offset as i32) as usize;
-            let col = point.column.0;
+            // 背景与文字使用不同的 run。光标单独绘制，因此 500ms 光标闪烁
+            // 不会让整屏文字缓存失效。
+            self.render_runs.clear();
+            self.background_runs.clear();
+            let runs = &mut self.render_runs;
+            let backgrounds = &mut self.background_runs;
 
-            let is_cursor =
-                cursor_visible && cursor_vp.is_some_and(|p| p.line == row && p.column == col);
-            let selected = content.selection.as_ref().is_some_and(|sel| {
-                sel.contains_cell(&indexed, content.cursor.point, content.cursor.shape)
-            });
+            for indexed in content.display_iter {
+                let point = indexed.point;
+                let cell = indexed.cell;
+                let row = (point.line.0 + display_offset as i32) as usize;
+                let col = point.column.0;
+                let selected = content.selection.as_ref().is_some_and(|sel| {
+                    sel.contains_cell(&indexed, content.cursor.point, content.cursor.shape)
+                });
 
-            let bold = cell.flags.intersects(Flags::BOLD | Flags::DIM_BOLD);
-            let mut fg = resolve(cell.fg, colors, bold);
-            let mut bg = resolve(cell.bg, colors, false);
-            let mut paint_bg = !matches!(cell.bg, Color::Named(NamedColor::Background));
-            if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-                paint_bg = true;
-            }
-            if cell.flags.contains(Flags::DIM) {
-                fg = dim(fg);
-            }
-            if selected {
-                bg = SELECTION_BG;
-                paint_bg = true;
-            }
-            if is_cursor && content.cursor.shape == CursorShape::Block {
-                fg = background_color;
-                bg = CURSOR;
-                paint_bg = true;
-            }
+                let bold = cell.flags.intersects(Flags::BOLD | Flags::DIM_BOLD);
+                let mut fg = resolve(cell.fg, colors, bold);
+                let mut bg = resolve(cell.bg, colors, false);
+                let mut paint_bg = !matches!(cell.bg, Color::Named(NamedColor::Background));
+                if cell.flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                    paint_bg = true;
+                }
+                if cell.flags.contains(Flags::DIM) {
+                    fg = dim(fg);
+                }
+                if selected {
+                    bg = SELECTION_BG;
+                    paint_bg = true;
+                }
 
-            if paint_bg {
-                match backgrounds.last_mut() {
-                    Some(run) if run.row == row && run.end_col == col && run.color == bg => {
+                if paint_bg {
+                    match backgrounds.last_mut() {
+                        Some(run) if run.row == row && run.end_col == col && run.color == bg => {
+                            run.end_col = col + 1;
+                        }
+                        _ => backgrounds.push(BackgroundRun {
+                            row,
+                            start_col: col,
+                            end_col: col + 1,
+                            color: bg,
+                        }),
+                    }
+                }
+
+                let ch = if cell.flags.contains(Flags::HIDDEN) {
+                    ' '
+                } else {
+                    cell.c
+                };
+                let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+                let flags = flags_relevant(cell.flags);
+
+                match runs.last_mut() {
+                    Some(run)
+                        if run.row == row
+                            && run.end_col == col
+                            && run.fg == fg
+                            && run.flags == flags
+                            && !run.sealed =>
+                    {
+                        if spacer {
+                            run.sealed = true;
+                        } else {
+                            run.text.push(ch);
+                        }
                         run.end_col = col + 1;
                     }
-                    _ => backgrounds.push(BackgroundRun {
-                        row,
-                        start_col: col,
-                        end_col: col + 1,
-                        color: bg,
-                    }),
+                    _ => {
+                        if spacer {
+                            continue;
+                        }
+                        // 前导空格不参与 shaping，文字始终从真实网格列开始。
+                        if ch == ' ' && !flags.intersects(Flags::UNDERLINE | Flags::STRIKEOUT) {
+                            continue;
+                        }
+                        runs.push(RenderRun {
+                            row,
+                            start_col: col,
+                            end_col: col + 1,
+                            fg,
+                            flags,
+                            text: ch.to_string(),
+                            sealed: false,
+                        });
+                    }
                 }
             }
 
-            let ch = if cell.flags.contains(Flags::HIDDEN) {
-                ' '
-            } else {
-                cell.c
-            };
-
-            // 宽字符占位格:只并入背景,不追加文本
-            let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
-            let flags = flags_relevant(cell.flags);
-
-            match runs.last_mut() {
-                Some(run)
-                    if run.row == row
-                        && run.end_col == col
-                        && run.fg == fg
-                        && run.flags == flags
-                        && !run.sealed
-                        && !is_cursor =>
-                {
-                    if spacer {
-                        run.sealed = true;
-                    } else {
-                        run.text.push(ch);
-                    }
-                    run.end_col = col + 1;
+            self.cached_text_runs.clear();
+            for run in &self.render_runs {
+                if run.text.trim().is_empty() {
+                    continue;
                 }
-                _ => {
-                    // spacer 是前一个宽字符的第二个网格单元，不应成为独立文字。
-                    if spacer {
-                        continue;
-                    }
-                    // 不把行首/缩进空格放进待 shaping 的字符串。文字直接从真实
-                    // 单元格列开始绘制，选区变化时不会因前导空格重新排版而偏移。
-                    if ch == ' ' && !flags.intersects(Flags::UNDERLINE | Flags::STRIKEOUT) {
-                        continue;
-                    }
-                    // 光标单元格强制独立 run,避免颜色被相邻合并后错位
-                    runs.push(RenderRun {
-                        row,
-                        start_col: col,
-                        end_col: col + 1,
-                        fg,
-                        flags,
-                        text: ch.to_string(),
-                        sealed: false,
-                    });
-                }
+                self.cached_text_runs.push(CachedTextRun {
+                    row: run.row,
+                    start_col: run.start_col,
+                    end_col: run.end_col,
+                    fg: run.fg,
+                    flags: run.flags,
+                    galley: painter.layout_no_wrap(run.text.clone(), font.clone(), run.fg),
+                });
             }
+            self.render_cache_key = Some(cache_key);
         }
 
-        // 先统一绘制全部背景，再绘制文字。否则后一个选区 run 的背景可能覆盖
-        // 前一个文字 run 在字形边缘处的像素。
-        for run in backgrounds.iter() {
+        // 先统一绘制全部背景，再复用已 shaping 的 Galley 绘制文字。
+        for run in &self.background_runs {
             let x = rect.left() + run.start_col as f32 * cell_w;
             let y = rect.top() + run.row as f32 * cell_h;
             let w = (run.end_col - run.start_col) as f32 * cell_w;
@@ -819,20 +921,12 @@ impl TermView {
             painter.rect_filled(run_rect, 0.0, run.color);
         }
 
-        for run in runs.iter() {
+        for run in &self.cached_text_runs {
             let x = rect.left() + run.start_col as f32 * cell_w;
             let y = rect.top() + run.row as f32 * cell_h;
             let w = (run.end_col - run.start_col) as f32 * cell_w;
             let run_rect = Rect::from_min_size(Pos2::new(x, y), vec2(w, cell_h));
-            if !run.text.trim().is_empty() {
-                painter.text(
-                    Pos2::new(x, y),
-                    Align2::LEFT_TOP,
-                    &run.text,
-                    font.clone(),
-                    run.fg,
-                );
-            }
+            painter.galley(Pos2::new(x, y), run.galley.clone(), run.fg);
             if run.flags.contains(Flags::UNDERLINE) {
                 painter.line_segment(
                     [run_rect.left_bottom(), run_rect.right_bottom()],
@@ -851,11 +945,38 @@ impl TermView {
             }
         }
 
-        // 非块状光标
+        let content = self.term.renderable_content();
+        let display_offset = content.display_offset;
+        let cursor_vp = term::point_to_viewport(display_offset, content.cursor.point);
+        let cursor_visible = cursor_blink_visible && content.cursor.shape != CursorShape::Hidden;
+
+        // 光标独立于网格缓存绘制；块状光标覆盖底下的普通文字，再只重画
+        // 当前单元格字符，避免光标相位让整屏缓存失效。
         if cursor_visible && let Some(p) = cursor_vp {
             let x = rect.left() + p.column.0 as f32 * cell_w;
             let y = rect.top() + p.line as f32 * cell_h;
             match content.cursor.shape {
+                CursorShape::Block => {
+                    painter.rect_filled(
+                        Rect::from_min_size(Pos2::new(x, y), vec2(cell_w, cell_h)),
+                        0.0,
+                        CURSOR,
+                    );
+                    let cell = &self.term.grid()[content.cursor.point];
+                    if !cell
+                        .flags
+                        .intersects(Flags::HIDDEN | Flags::WIDE_CHAR_SPACER)
+                        && cell.c != ' '
+                    {
+                        painter.text(
+                            Pos2::new(x, y),
+                            Align2::LEFT_TOP,
+                            cell.c,
+                            font.clone(),
+                            background_color,
+                        );
+                    }
+                }
                 CursorShape::Beam => {
                     painter.vline(x, y..=y + cell_h, Stroke::new(1.5, CURSOR));
                 }
@@ -915,19 +1036,21 @@ impl TermView {
             let lines = selection_autoscroll_lines(pos.y, rect, cell_h);
             if lines != 0 {
                 self.term.scroll_display(Scroll::Delta(lines));
+                self.mark_render_dirty();
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
 
         let display_offset = self.term.grid().display_offset();
+        let (cols, rows) = (self.dims.cols, self.dims.rows);
         let to_point = |pos: Pos2| -> Point {
             let col = ((pos.x - rect.left()) / cell_w)
                 .floor()
-                .clamp(0.0, self.dims.cols as f32 - 1.0) as usize;
+                .clamp(0.0, cols as f32 - 1.0) as usize;
             let row = ((pos.y - rect.top()) / cell_h)
                 .floor()
-                .clamp(0.0, self.dims.rows as f32 - 1.0) as usize;
+                .clamp(0.0, rows as f32 - 1.0) as usize;
             term::viewport_to_point(display_offset, Point::new(row, Column(col)))
         };
 
@@ -942,6 +1065,7 @@ impl TermView {
             self.term.selection = None;
             self.sel_anchor = None;
             self.selection_copy_pos = None;
+            self.mark_render_dirty();
         }
 
         if response.drag_started_by(egui::PointerButton::Primary) {
@@ -951,6 +1075,7 @@ impl TermView {
                 self.term.selection =
                     Some(Selection::new(SelectionType::Simple, point, Side::Left));
                 self.sel_anchor = Some(point);
+                self.mark_render_dirty();
             }
         } else if response.dragged_by(egui::PointerButton::Primary)
             && let (Some(anchor), Some(pos)) = (self.sel_anchor, response.interact_pointer_pos())
@@ -963,6 +1088,7 @@ impl TermView {
             };
             if let Some(sel) = self.term.selection.as_mut() {
                 sel.update(point, side);
+                self.mark_render_dirty();
             }
         }
 
@@ -972,6 +1098,7 @@ impl TermView {
             let point = to_point(pos);
             self.term.selection = Some(Selection::new(SelectionType::Semantic, point, Side::Left));
             self.selection_copy_pos = Some(pos + vec2(9.0, 9.0));
+            self.mark_render_dirty();
         }
         if response.triple_clicked()
             && let Some(pos) = response.interact_pointer_pos()
@@ -979,6 +1106,7 @@ impl TermView {
             let point = to_point(pos);
             self.term.selection = Some(Selection::new(SelectionType::Lines, point, Side::Left));
             self.selection_copy_pos = Some(pos + vec2(9.0, 9.0));
+            self.mark_render_dirty();
         }
 
         if response.drag_stopped_by(egui::PointerButton::Primary) {
@@ -1146,10 +1274,12 @@ impl TermView {
             }),
             Key::PageUp => {
                 self.term.scroll_display(Scroll::PageUp);
+                self.mark_render_dirty();
                 None
             }
             Key::PageDown => {
                 self.term.scroll_display(Scroll::PageDown);
+                self.mark_render_dirty();
                 None
             }
             _ => {
@@ -1172,8 +1302,13 @@ impl TermView {
         if let Some(bytes) = seq {
             let _ = self.cmd_tx.send(SessionCmd::Input(bytes));
             self.term.scroll_display(Scroll::Bottom);
+            self.mark_render_dirty();
         }
     }
+}
+
+fn window_has_focus(ui: &egui::Ui) -> bool {
+    ui.input(|input| input.viewport().focused.unwrap_or(input.raw.focused))
 }
 
 /// 影响渲染合并的 flag 位
@@ -1232,6 +1367,7 @@ fn letter_index(key: egui::Key) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn selection_autoscroll_uses_terminal_scroll_direction() {
@@ -1241,5 +1377,183 @@ mod tests {
         assert_eq!(selection_autoscroll_lines(205.0, rect, 20.0), -1);
         assert_eq!(selection_autoscroll_lines(-200.0, rect, 20.0), 6);
         assert_eq!(selection_autoscroll_lines(500.0, rect, 20.0), -6);
+    }
+
+    #[test]
+    fn cursor_is_hidden_when_window_or_terminal_is_unfocused() {
+        let ctx = egui::Context::default();
+        let (cmd_tx, _cmd_rx) = session::cmd_channel();
+        let (_data_tx, data_rx) = session::data_channel(ctx.clone());
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut view = TermView::with_channels(
+            &ctx,
+            TermDims { cols: 80, rows: 24 },
+            cmd_tx,
+            data_rx,
+            event_rx,
+            None,
+        );
+
+        let mut unfocused_input = egui::RawInput {
+            focused: false,
+            ..Default::default()
+        };
+        unfocused_input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .focused = Some(false);
+        let mut visible_without_window_focus = true;
+        let _ = ctx.run_ui(unfocused_input, |ui| {
+            visible_without_window_focus = view.cursor_blink_visible(ui, true);
+        });
+        assert!(!visible_without_window_focus);
+
+        let mut visible_without_terminal_focus = true;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            visible_without_terminal_focus = view.cursor_blink_visible(ui, false);
+        });
+        assert!(!visible_without_terminal_focus);
+    }
+
+    #[test]
+    fn terminal_recovers_focus_after_window_interaction_and_activation() {
+        let ctx = egui::Context::default();
+        crate::install_app_fonts(&ctx, "Hack");
+        let (cmd_tx, _cmd_rx) = session::cmd_channel();
+        let (_data_tx, data_rx) = session::data_channel(ctx.clone());
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut view = TermView::with_channels(
+            &ctx,
+            TermDims { cols: 80, rows: 24 },
+            cmd_tx,
+            data_rx,
+            event_rx,
+            None,
+        );
+        view.request_initial_focus = false;
+
+        let other_id = egui::Id::new("focus-before-window-activation");
+        let mut other_input = String::new();
+        let background = TermBackground {
+            color: BG,
+            image: None,
+            image_mode: crate::config::TerminalImageMode::Stretch,
+            image_darkness: 0,
+        };
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut other_input).id(other_id))
+                .request_focus();
+            view.show(ui, &background, 13.0, false);
+        });
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(other_id));
+
+        let mut activation_input = egui::RawInput {
+            events: vec![egui::Event::WindowFocused(true)],
+            ..Default::default()
+        };
+        activation_input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .focused = Some(true);
+        let _ = ctx.run_ui(activation_input, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut other_input).id(other_id));
+            view.show(ui, &background, 13.0, false);
+        });
+        let terminal_id = ctx
+            .memory(|memory| memory.focused())
+            .expect("active terminal should receive focus");
+        assert_ne!(terminal_id, other_id);
+
+        ctx.memory_mut(|memory| memory.surrender_focus(terminal_id));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut other_input).id(other_id));
+            view.show(ui, &background, 13.0, false);
+        });
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(terminal_id));
+    }
+
+    #[test]
+    fn tab_activation_can_request_terminal_focus_again() {
+        let ctx = egui::Context::default();
+        crate::install_app_fonts(&ctx, "Hack");
+        let (cmd_tx, _cmd_rx) = session::cmd_channel();
+        let (_data_tx, data_rx) = session::data_channel(ctx.clone());
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut view = TermView::with_channels(
+            &ctx,
+            TermDims { cols: 80, rows: 24 },
+            cmd_tx,
+            data_rx,
+            event_rx,
+            None,
+        );
+        view.request_initial_focus = false;
+
+        let other_id = egui::Id::new("focus-before-tab-switch");
+        let mut other_input = String::new();
+        let background = TermBackground {
+            color: BG,
+            image: None,
+            image_mode: crate::config::TerminalImageMode::Stretch,
+            image_darkness: 0,
+        };
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut other_input).id(other_id))
+                .request_focus();
+            view.show(ui, &background, 13.0, false);
+        });
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(other_id));
+
+        view.request_focus();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut other_input).id(other_id));
+            view.show(ui, &background, 13.0, false);
+        });
+
+        assert!(!view.request_initial_focus);
+        assert_ne!(ctx.memory(|memory| memory.focused()), Some(other_id));
+    }
+
+    #[test]
+    fn cursor_blink_reuses_cached_terminal_galleys() {
+        let ctx = egui::Context::default();
+        let (cmd_tx, _cmd_rx) = session::cmd_channel();
+        let (_data_tx, data_rx) = session::data_channel(ctx.clone());
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut view = TermView::with_channels(
+            &ctx,
+            TermDims { cols: 80, rows: 24 },
+            cmd_tx,
+            data_rx,
+            event_rx,
+            None,
+        );
+        view.feed_str("cached terminal text");
+
+        let mut first_galley = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            view.render_grid(
+                ui.painter(),
+                Rect::from_min_size(Pos2::ZERO, vec2(640.0, 384.0)),
+                &FontId::monospace(13.0),
+                vec2(8.0, 16.0),
+                BG,
+                true,
+            );
+            first_galley = view.cached_text_runs.first().map(|run| run.galley.clone());
+            view.render_grid(
+                ui.painter(),
+                Rect::from_min_size(Pos2::ZERO, vec2(640.0, 384.0)),
+                &FontId::monospace(13.0),
+                vec2(8.0, 16.0),
+                BG,
+                false,
+            );
+        });
+        let first = first_galley.expect("terminal text should create a cached galley");
+        let second = &view.cached_text_runs[0].galley;
+        assert!(Arc::ptr_eq(&first, second));
     }
 }

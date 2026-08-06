@@ -14,7 +14,9 @@ use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::files::{FileEntry, SftpCmd, SftpEvent, SftpRx, TransferControl, sftp_channel};
-use super::monitor::{MONITOR_CMD, MonitorState};
+use super::monitor::{
+    MONITOR_DISKS_CMD, MONITOR_DYNAMIC_CMD, MONITOR_STATIC_CMD, MonitorState, SystemMetrics,
+};
 use super::{
     CmdRx, DataTx, HostKeyPrompt, HostKeyVerdict, SessionChannels, SessionCmd, SessionEvent,
     cmd_channel, data_channel,
@@ -42,17 +44,26 @@ pub struct SshParams {
 /// 进度/错误以终端可显示的文本形式写进 Data 事件。
 pub fn spawn(params: SshParams, cols: u16, rows: u16, ctx: egui::Context) -> SessionChannels {
     let (cmd_tx, cmd_rx) = cmd_channel();
-    let (data_tx, data_rx) = data_channel();
+    let (data_tx, data_rx) = data_channel(ctx.clone());
     let (event_tx, event_rx) = channel::<SessionEvent>();
     let (sftp_tx, sftp_rx) = sftp_channel();
     let sftp_tx_ret = sftp_tx.clone();
+    let (monitor_active_tx, monitor_active_rx) = tokio::sync::watch::channel(true);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("tokio runtime");
         rt.block_on(run(
-            params, cols, rows, cmd_rx, sftp_rx, data_tx, event_tx, ctx,
+            params,
+            cols,
+            rows,
+            cmd_rx,
+            sftp_rx,
+            data_tx,
+            event_tx,
+            ctx,
+            monitor_active_rx,
         ));
     });
     SessionChannels {
@@ -60,6 +71,7 @@ pub fn spawn(params: SshParams, cols: u16, rows: u16, ctx: egui::Context) -> Ses
         data_rx,
         event_rx,
         sftp_tx: sftp_tx_ret,
+        monitor_active_tx: Some(monitor_active_tx),
     }
 }
 
@@ -130,7 +142,6 @@ impl Handler for ClientHandler {
                                     "\x1b[1;31m保存主机指纹失败：{error:#}\x1b[0m\r\n"
                                 )))
                                 .await;
-                            self.ctx.request_repaint();
                             Ok(false)
                         } else {
                             Ok(true)
@@ -183,6 +194,7 @@ async fn run(
     data_tx: DataTx,
     event_tx: Sender<SessionEvent>,
     ctx: egui::Context,
+    monitor_active_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let (mut pty_cols, mut pty_rows) = (cols, rows);
     let mut pending_input = VecDeque::new();
@@ -191,7 +203,6 @@ async fn run(
     macro_rules! status {
         ($($arg:tt)*) => {{
             let _ = data_tx.send(ansi(&format!("\x1b[36m{}\x1b[0m\r\n", format!($($arg)*)))).await;
-            ctx.request_repaint();
         }};
     }
     macro_rules! fatal {
@@ -343,7 +354,15 @@ async fn run(
     let mon_ctx = ctx.clone();
     let mon_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        monitor_loop(mon_handle, mon_data_tx, mon_tx, mon_ctx, mon_shutdown).await;
+        monitor_loop(
+            mon_handle,
+            mon_data_tx,
+            mon_tx,
+            mon_ctx,
+            mon_shutdown,
+            monitor_active_rx,
+        )
+        .await;
     });
 
     // ---- SFTP 任务 ----
@@ -365,13 +384,11 @@ async fn run(
                         if send_terminal_data(&data_tx, &data).await.is_err() {
                             break;
                         }
-                        ctx.request_repaint();
                     }
                     Some(ChannelMsg::ExtendedData { data, .. }) => {
                         if send_terminal_data(&data_tx, &data).await.is_err() {
                             break;
                         }
-                        ctx.request_repaint();
                     }
                     Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
                         let _ = event_tx.send(SessionEvent::Exited);
@@ -426,17 +443,42 @@ async fn monitor_loop(
     event_tx: Sender<SessionEvent>,
     ctx: egui::Context,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut active_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut state = MonitorState::default();
     let mut consecutive_errors = 0u32;
+    let mut static_metrics: Option<SystemMetrics> = None;
+    let mut disks = Vec::new();
+    let mut next_disk_sample = Instant::now();
     // 等 shell 先起来
     tokio::time::sleep(Duration::from_millis(500)).await;
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
+        if !*active_rx.borrow() {
+            if !wait_for_next_monitor_sample(&mut active_rx).await {
+                break;
+            }
+            continue;
+        }
+        // 静态信息只在连接建立后获取一次；首次失败则随下一轮继续重试。
+        if static_metrics.is_none()
+            && let Ok(text) = run_exec(&handle, MONITOR_STATIC_CMD).await
+        {
+            static_metrics = Some(MonitorState::default().update(&text, 0));
+        }
+
+        // 当前标签每 5 秒更新磁盘；后台标签暂停监控，不再执行 df。
+        if Instant::now() >= next_disk_sample {
+            if let Ok(text) = run_exec(&handle, MONITOR_DISKS_CMD).await {
+                disks = MonitorState::default().update(&text, 0).disks;
+            }
+            next_disk_sample = Instant::now() + Duration::from_secs(5);
+        }
+
         let t0 = Instant::now();
-        match run_exec(&handle, MONITOR_CMD).await {
+        match run_exec(&handle, MONITOR_DYNAMIC_CMD).await {
             Ok(text) => {
                 if consecutive_errors > 0 {
                     let _ = data_tx
@@ -445,12 +487,28 @@ async fn monitor_loop(
                 }
                 consecutive_errors = 0;
                 let rtt = t0.elapsed().as_millis() as u32;
-                let metrics = state.update(&text, rtt);
+                let mut metrics = state.update(&text, rtt);
+                if let Some(cached) = &static_metrics {
+                    metrics.os_pretty.clone_from(&cached.os_pretty);
+                    metrics.kernel_name.clone_from(&cached.kernel_name);
+                    metrics.kernel_release.clone_from(&cached.kernel_release);
+                    metrics.arch.clone_from(&cached.arch);
+                    metrics.hostname.clone_from(&cached.hostname);
+                    metrics.cpu_model.clone_from(&cached.cpu_model);
+                    metrics.cpu_cores = cached.cpu_cores;
+                    metrics.cpu_mhz = cached.cpu_mhz;
+                    metrics.cpu_cache_kb = cached.cpu_cache_kb;
+                    metrics.cpu_bogomips = cached.cpu_bogomips;
+                }
+                metrics.disks.clone_from(&disks);
                 if event_tx
                     .send(SessionEvent::Metrics(Arc::new(metrics)))
                     .is_err()
                 {
                     break;
+                }
+                if *active_rx.borrow() {
+                    ctx.request_repaint();
                 }
             }
             Err(error) => {
@@ -460,14 +518,43 @@ async fn monitor_loop(
                     let _ = data_tx
                         .send(ansi("\x1b[33m系统监控暂时不可用，正在自动重试\x1b[0m\r\n"))
                         .await;
-                    ctx.request_repaint();
                 }
                 let delay = 1u64 << consecutive_errors.min(5);
                 tokio::time::sleep(Duration::from_secs(delay)).await;
                 continue;
             }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        if !wait_for_next_monitor_sample(&mut active_rx).await {
+            break;
+        }
+    }
+}
+
+/// 前台标签每秒采样；后台标签完全暂停。重新变为前台时立即采样。
+async fn wait_for_next_monitor_sample(active_rx: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    loop {
+        let active = *active_rx.borrow();
+        if !active {
+            if active_rx.changed().await.is_err() {
+                return false;
+            }
+            if *active_rx.borrow() {
+                return true;
+            }
+            continue;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => return true,
+            changed = active_rx.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+                if *active_rx.borrow() {
+                    return true;
+                }
+                // 刚切到后台：等待再次激活，不执行后台采样。
+            }
+        }
     }
 }
 
@@ -1740,6 +1827,31 @@ mod tests {
             &mut rows,
             &mut input,
         ));
+    }
+
+    #[test]
+    fn background_monitor_waits_until_reactivated() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (active_tx, mut active_rx) = tokio::sync::watch::channel(false);
+            let mut wait =
+                tokio::spawn(async move { wait_for_next_monitor_sample(&mut active_rx).await });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                    .await
+                    .is_err()
+            );
+            active_tx.send(true).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), wait)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            );
+        });
     }
 
     /// 内置测试 SSH 服务器:密码 test/test123,shell 通道回显输入

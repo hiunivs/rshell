@@ -3,6 +3,9 @@ pub mod local;
 pub mod monitor;
 pub mod ssh;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// UI → 会话的命令
 pub enum SessionCmd {
     /// 写入终端的字节(键盘输入、应答序列等)
@@ -52,11 +55,93 @@ pub fn cmd_channel() -> (CmdTx, CmdRx) {
 }
 
 /// 终端输出使用有界通道；每块不超过 64 KiB 时，最多积压约 16 MiB。
-pub type DataTx = tokio::sync::mpsc::Sender<Vec<u8>>;
-pub type DataRx = tokio::sync::mpsc::Receiver<Vec<u8>>;
+///
+/// `repaint_pending` 把高频终端输出的 UI 唤醒合并为“队列从空变为非空”一次。
+/// UI 排空队列后才允许生产者再次唤醒，避免每个 SSH 数据包都向 macOS 事件
+/// 循环投递一次重绘请求。
+#[derive(Clone)]
+pub struct DataTx {
+    inner: tokio::sync::mpsc::Sender<Vec<u8>>,
+    repaint_pending: Arc<AtomicBool>,
+    ctx: egui::Context,
+}
 
-pub fn data_channel() -> (DataTx, DataRx) {
-    tokio::sync::mpsc::channel(256)
+pub struct DataRx {
+    inner: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    repaint_pending: Arc<AtomicBool>,
+    ctx: egui::Context,
+}
+
+impl DataTx {
+    pub async fn send(
+        &self,
+        value: Vec<u8>,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        self.inner.send(value).await?;
+        self.wake_ui_once();
+        Ok(())
+    }
+
+    pub fn blocking_send(
+        &self,
+        value: Vec<u8>,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        self.inner.blocking_send(value)?;
+        self.wake_ui_once();
+        Ok(())
+    }
+
+    fn wake_ui_once(&self) {
+        if !self.repaint_pending.swap(true, Ordering::AcqRel) {
+            self.ctx.request_repaint();
+        }
+    }
+
+    #[cfg(test)]
+    fn try_send(
+        &self,
+        value: Vec<u8>,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<Vec<u8>>> {
+        self.inner.try_send(value)?;
+        self.wake_ui_once();
+        Ok(())
+    }
+}
+
+impl DataRx {
+    pub fn try_recv(&mut self) -> Result<Vec<u8>, tokio::sync::mpsc::error::TryRecvError> {
+        self.inner.try_recv()
+    }
+
+    /// 一帧解析结束后更新唤醒闸门。队列仍有积压时安排下一帧；已经排空时
+    /// 先释放闸门再复查，避免生产者恰好在空队列检查期间发送数据而丢失唤醒。
+    pub fn finish_poll(&self) {
+        if !self.inner.is_empty() {
+            self.ctx.request_repaint();
+            return;
+        }
+        self.repaint_pending.store(false, Ordering::Release);
+        if !self.inner.is_empty() && !self.repaint_pending.swap(true, Ordering::AcqRel) {
+            self.ctx.request_repaint();
+        }
+    }
+}
+
+pub fn data_channel(ctx: egui::Context) -> (DataTx, DataRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel(256);
+    let repaint_pending = Arc::new(AtomicBool::new(false));
+    (
+        DataTx {
+            inner: tx,
+            repaint_pending: Arc::clone(&repaint_pending),
+            ctx: ctx.clone(),
+        },
+        DataRx {
+            inner: rx,
+            repaint_pending,
+            ctx,
+        },
+    )
 }
 
 /// 一个会话对外暴露的全部通道
@@ -65,6 +150,8 @@ pub struct SessionChannels {
     pub data_rx: DataRx,
     pub event_rx: std::sync::mpsc::Receiver<SessionEvent>,
     pub sftp_tx: files::SftpTx,
+    /// SSH 监控前后台状态；本机会话由应用级采样器统一管理。
+    pub monitor_active_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 #[cfg(test)]
@@ -73,13 +160,19 @@ mod tests {
 
     #[test]
     fn terminal_data_channel_has_hard_capacity() {
-        let (tx, _rx) = data_channel();
+        let (tx, mut rx) = data_channel(egui::Context::default());
         for _ in 0..256 {
             tx.try_send(vec![0; 64 * 1024]).unwrap();
         }
+        assert!(tx.repaint_pending.load(Ordering::Acquire));
         assert!(matches!(
             tx.try_send(vec![0]),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_))
         ));
+        for _ in 0..256 {
+            rx.try_recv().unwrap();
+        }
+        rx.finish_poll();
+        assert!(!tx.repaint_pending.load(Ordering::Acquire));
     }
 }

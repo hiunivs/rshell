@@ -21,6 +21,10 @@ cargo test          # 单元与回环测试：pty、SSH、监控解析、文件�
 cargo test -- --ignored   # 另跑真实系统 keyring 读写测试
 ```
 
+## 软件更新与发布
+
+应用使用平台原生的安全更新机制：macOS 为 Sparkle 2，Windows 为签名 MSIX + App Installer。开发构建默认不连接更新服务器；签名、Notarization、清单生成和发布步骤见 [docs/UPDATES.md](docs/UPDATES.md)。
+
 ## 技术栈
 
 egui 0.35 · alacritty_terminal · russh + russh-sftp · portable-pty · sysinfo · keyring · tokio · syntect

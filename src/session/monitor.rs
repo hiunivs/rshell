@@ -98,15 +98,21 @@ impl DiskInfo {
 // 远程采集
 // ---------------------------------------------------------------------------
 
-/// 一次 exec 拿全部数据,段间用 =XXX 分隔
-pub const MONITOR_CMD: &str = concat!(
+/// 高频动态指标。只保留侧栏每秒确实会变化的数据。
+pub const MONITOR_DYNAMIC_CMD: &str = concat!(
     "echo =STAT; grep '^cpu ' /proc/stat;",
     "echo =LOAD; cat /proc/loadavg;",
     "echo =UP; cat /proc/uptime;",
     "echo =MEM; cat /proc/meminfo;",
     "echo =NET; cat /proc/net/dev;",
-    "echo =PS; ps -eo rss,pcpu,comm 2>/dev/null;",
-    "echo =DF; df -kP 2>/dev/null;",
+    "echo =PS; ps -eo rss,pcpu,comm 2>/dev/null;"
+);
+
+/// 文件系统变化慢，独立降低采样频率。
+pub const MONITOR_DISKS_CMD: &str = "echo =DF; df -kP 2>/dev/null;";
+
+/// 连接生命周期内基本不变的信息，只在连接建立后采集一次。
+pub const MONITOR_STATIC_CMD: &str = concat!(
     "echo =OS; grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null;",
     "echo K=$(uname -s); echo R=$(uname -r); echo M=$(uname -m); echo H=$(hostname);",
     "echo =CPUINFO; LC_ALL=C lscpu 2>/dev/null"

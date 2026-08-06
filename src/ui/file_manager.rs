@@ -447,10 +447,12 @@ fn transfer_pane_toggle(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
 fn fm_toolbar(ui: &mut egui::Ui, fm: &mut FileManager, ts: &TransferSettings) {
     ui.horizontal(|ui| {
         // 路径框:缩短,给右侧按钮 + 加载提示预留固定宽度
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut fm.path_edit)
-                .desired_width((ui.available_width() - 360.0).max(60.0)),
-        );
+        let resp = ui
+            .add(
+                egui::TextEdit::singleline(&mut fm.path_edit)
+                    .desired_width((ui.available_width() - 360.0).max(60.0)),
+            )
+            .on_hover_cursor(egui::CursorIcon::Default);
         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             let path = fm.path_edit.clone();
             fm.navigate(&path);
@@ -638,7 +640,12 @@ fn fm_tree(ui: &mut egui::Ui, fm: &mut FileManager) {
         let is_cwd = normalize_path(path) == fm.cwd;
         // 子项已加载(展开过/已取回子目录)→ 蓝色;否则灰蓝色
         let loaded = fm.tree_children.contains_key(path.as_str());
-        ui.horizontal(|ui| {
+        // 先占一个绘制槽，等所有子控件响应合并后再把悬停背景放回文字/图标
+        // 之前，确保整行阴影不会盖住内容。
+        let hover_background = ui.painter().add(egui::Shape::Noop);
+        let row = ui.horizontal(|ui| {
+            ui.set_min_width(ui.available_width());
+            let mut content_responses = Vec::with_capacity(4);
             ui.add_space(4.0 + *depth as f32 * 14.0);
             // 未展开时不显示收起箭头；展开后才显示 ▼，固定占位保持目录对齐。
             if *expanded {
@@ -650,14 +657,18 @@ fn fm_tree(ui: &mut egui::Ui, fm: &mut FileManager) {
                     10.0,
                     ui.visuals().weak_text_color(),
                 );
+                content_responses.push(collapse.clone());
                 if collapse.clicked() {
                     fm.toggle_tree(path);
                 }
             } else {
-                ui.allocate_exact_size(vec2(12.0, 14.0), egui::Sense::hover());
+                let (_, response) = ui.allocate_exact_size(vec2(12.0, 14.0), egui::Sense::hover());
+                content_responses.push(response);
             }
             // 文件夹图标:已加载=蓝色,未加载=灰蓝色(与右侧文件表同款)
-            let (icon_rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
+            let (icon_rect, icon_response) =
+                ui.allocate_exact_size(vec2(14.0, 14.0), egui::Sense::hover());
+            content_responses.push(icon_response);
             let color = if loaded {
                 Color32::from_rgb(0x4C, 0x9B, 0xE8)
             } else {
@@ -683,6 +694,7 @@ fn fm_tree(ui: &mut egui::Ui, fm: &mut FileManager) {
                 )
                 .on_hover_and_drag_cursor(egui::CursorIcon::Default)
                 .on_hover_text(path.as_str());
+            content_responses.push(dir_response.clone());
             if dir_response.clicked() {
                 // 点击目录名:展开该节点并进入该目录
                 fm.expand_tree(path);
@@ -699,9 +711,31 @@ fn fm_tree(ui: &mut egui::Ui, fm: &mut FileManager) {
                 }
             });
             if *loading {
-                ui.label(RichText::new("…").weak().small());
+                content_responses.push(ui.label(RichText::new("…").weak().small()));
             }
+            content_responses
+                .into_iter()
+                .reduce(|row_response, content_response| row_response.union(content_response))
         });
+        let hovered = row.inner.map_or_else(
+            || row.response.contains_pointer(),
+            |content_response| {
+                row.response
+                    .clone()
+                    .union(content_response)
+                    .contains_pointer()
+            },
+        );
+        if hovered {
+            ui.painter().set(
+                hover_background,
+                egui::Shape::rect_filled(
+                    row.response.rect,
+                    egui::CornerRadius::ZERO,
+                    ui.visuals().widgets.hovered.bg_fill,
+                ),
+            );
+        }
     }
 }
 
@@ -1526,6 +1560,81 @@ mod tests {
             "active={}, commands={:?}",
             harness.state().table_keyboard_active,
             harness.output().platform_output.commands
+        );
+    }
+
+    #[test]
+    fn path_field_uses_arrow_cursor_while_remaining_editable() {
+        let mut fm = FileManager::new(None);
+        fm.path_edit = "/tmp".into();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 80.0))
+            .build_ui_state(
+                |ui, fm: &mut FileManager| {
+                    fm_toolbar(ui, fm, &TransferSettings::default());
+                },
+                fm,
+            );
+
+        let path_field = harness.get_by_role(egui::accesskit::Role::TextInput);
+        path_field.hover();
+        harness.run();
+
+        assert_eq!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::Default
+        );
+        assert_eq!(
+            harness
+                .get_by_role(egui::accesskit::Role::TextInput)
+                .value()
+                .as_deref(),
+            Some("/tmp")
+        );
+    }
+
+    #[test]
+    fn tree_hover_highlight_covers_the_full_row() {
+        fn has_hover_rect(shape: &egui::Shape, color: Color32, point: Pos2) -> bool {
+            match shape {
+                egui::Shape::Rect(rect) => rect.fill == color && rect.rect.contains(point),
+                egui::Shape::Vec(shapes) => shapes
+                    .iter()
+                    .any(|shape| has_hover_rect(shape, color, point)),
+                _ => false,
+            }
+        }
+
+        let fm = FileManager::new(None);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(320.0, 120.0))
+            .build_ui_state(
+                |ui, fm: &mut FileManager| {
+                    fm_tree(ui, fm);
+                },
+                fm,
+            );
+        harness.run();
+
+        let label_rect = harness.get_by_label("/").rect();
+        harness.hover_at(label_rect.center());
+        harness.run();
+
+        let blank_row_point = Pos2::new(300.0, label_rect.center().y);
+        let hover_fill = harness
+            .ctx
+            .style_of(harness.ctx.theme())
+            .visuals
+            .widgets
+            .hovered
+            .bg_fill;
+        assert!(
+            harness
+                .output()
+                .shapes
+                .iter()
+                .any(|clipped| { has_hover_rect(&clipped.shape, hover_fill, blank_row_point) }),
+            "hover highlight should extend through the blank area at the end of the tree row"
         );
     }
 

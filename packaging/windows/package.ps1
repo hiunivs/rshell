@@ -1,0 +1,158 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][ValidateSet("x64", "arm64")][string]$Architecture,
+    [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$BuildNumber,
+    [Parameter(Mandatory = $true)][string]$Publisher,
+    [Parameter(Mandatory = $true)][string]$PublisherDisplayName,
+    [Parameter(Mandatory = $true)][string]$UpdateBaseUrl,
+    [string]$BetaUpdateBaseUrl,
+    [ValidateSet("stable", "beta")][string]$ReleaseChannel = "stable",
+    [ValidatePattern('^[A-Za-z0-9.-]{3,50}$')][string]$PackageName = "com.rshell.rshell"
+)
+
+$ErrorActionPreference = "Stop"
+$RootDir = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+$CargoToml = Get-Content (Join-Path $RootDir "Cargo.toml") -Raw
+$Match = [regex]::Match($CargoToml, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"')
+if (-not $Match.Success) { throw "Cargo package version was not found" }
+$SemVer = $Match.Groups["version"].Value
+$Parts = $SemVer.Split(".")
+foreach ($Part in $Parts) {
+    if ([int]$Part -gt 65535) { throw "Each Windows package version component must be <= 65535" }
+}
+$PackageVersion = "$($Parts[0]).$($Parts[1]).$($Parts[2]).$BuildNumber"
+
+function Get-SecureBaseUrl([string]$Name, [string]$Value) {
+    $Uri = [Uri]$Value
+    if (-not $Uri.IsAbsoluteUri -or $Uri.Scheme -ne "https") {
+        throw "$Name must be an absolute HTTPS URL"
+    }
+    if ($Uri.UserInfo -or $Uri.Fragment -or $Uri.Query) {
+        throw "$Name cannot contain credentials, a query, or a fragment"
+    }
+    return $Value.TrimEnd("/")
+}
+
+function Assert-NativeSuccess([string]$Step) {
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Step failed with exit code $LASTEXITCODE"
+    }
+}
+
+$StableBaseUrl = Get-SecureBaseUrl "UpdateBaseUrl" $UpdateBaseUrl
+$BetaBaseUrl = $null
+if ($BetaUpdateBaseUrl) {
+    $BetaBaseUrl = Get-SecureBaseUrl "BetaUpdateBaseUrl" $BetaUpdateBaseUrl
+}
+if ($ReleaseChannel -eq "beta" -and -not $BetaBaseUrl) {
+    throw "BetaUpdateBaseUrl is required when ReleaseChannel is beta"
+}
+$ReleaseBaseUrl = if ($ReleaseChannel -eq "beta") { $BetaBaseUrl } else { $StableBaseUrl }
+
+$Target = if ($Architecture -eq "x64") { "x86_64-pc-windows-msvc" } else { "aarch64-pc-windows-msvc" }
+if (Get-Command rustup -ErrorAction SilentlyContinue) {
+    rustup target add $Target
+    Assert-NativeSuccess "Installing Rust target"
+}
+$env:RSHELL_WINDOWS_APPINSTALLER_URL = "$StableBaseUrl/RShell.appinstaller"
+if ($BetaBaseUrl) {
+    $env:RSHELL_WINDOWS_BETA_APPINSTALLER_URL = "$BetaBaseUrl/RShell.appinstaller"
+} else {
+    Remove-Item Env:RSHELL_WINDOWS_BETA_APPINSTALLER_URL -ErrorAction SilentlyContinue
+}
+cargo build --locked --release --target $Target --manifest-path (Join-Path $RootDir "Cargo.toml")
+Assert-NativeSuccess "Building RShell"
+
+$DistDir = Join-Path $RootDir "dist/windows/$ReleaseChannel"
+$StageDir = Join-Path $env:TEMP ("rshell-msix-" + [Guid]::NewGuid().ToString("N"))
+$PackageDir = Join-Path $StageDir "package"
+$BundleInputDir = Join-Path $StageDir "bundle"
+New-Item -ItemType Directory -Force $PackageDir, (Join-Path $PackageDir "Assets"), $BundleInputDir, $DistDir | Out-Null
+
+try {
+    Copy-Item (Join-Path $RootDir "target/$Target/release/rshell.exe") (Join-Path $PackageDir "rshell.exe")
+    $Manifest = Get-Content (Join-Path $PSScriptRoot "AppxManifest.xml") -Raw
+    $Manifest = $Manifest.Replace("__PACKAGE_NAME__", [Security.SecurityElement]::Escape($PackageName))
+    $Manifest = $Manifest.Replace("__PUBLISHER__", [Security.SecurityElement]::Escape($Publisher))
+    $Manifest = $Manifest.Replace("__PUBLISHER_DISPLAY_NAME__", [Security.SecurityElement]::Escape($PublisherDisplayName))
+    $Manifest = $Manifest.Replace("__VERSION__", $PackageVersion)
+    $Manifest = $Manifest.Replace("__ARCH__", $Architecture)
+    Set-Content (Join-Path $PackageDir "AppxManifest.xml") $Manifest -Encoding utf8
+
+    Add-Type -AssemblyName System.Drawing
+    $Assets = @{
+        "StoreLogo.png" = 50
+        "Square44x44Logo.png" = 44
+        "Square150x150Logo.png" = 150
+    }
+    foreach ($Asset in $Assets.GetEnumerator()) {
+        $Bitmap = [System.Drawing.Bitmap]::new($Asset.Value, $Asset.Value)
+        $Graphics = [System.Drawing.Graphics]::FromImage($Bitmap)
+        try {
+            $Graphics.Clear([System.Drawing.Color]::FromArgb(42, 109, 217))
+            $FontSize = [Math]::Max(16, [Math]::Floor($Asset.Value * 0.55))
+            $Font = [System.Drawing.Font]::new("Segoe UI", $FontSize, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+            try {
+                $Format = [System.Drawing.StringFormat]::new()
+                try {
+                    $Format.Alignment = [System.Drawing.StringAlignment]::Center
+                    $Format.LineAlignment = [System.Drawing.StringAlignment]::Center
+                    $Brush = [System.Drawing.Brushes]::White
+                    $Rect = [System.Drawing.RectangleF]::new(0, 0, $Asset.Value, $Asset.Value)
+                    $Graphics.DrawString("R", $Font, $Brush, $Rect, $Format)
+                } finally { $Format.Dispose() }
+            } finally { $Font.Dispose() }
+            $Bitmap.Save((Join-Path $PackageDir "Assets/$($Asset.Key)"), [System.Drawing.Imaging.ImageFormat]::Png)
+        } finally {
+            $Graphics.Dispose()
+            $Bitmap.Dispose()
+        }
+    }
+
+    $SdkBin = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    if (-not $SdkBin) { throw "Windows SDK tools were not found" }
+    $MakeAppx = Join-Path $SdkBin.FullName "makeappx.exe"
+    $SignTool = Join-Path $SdkBin.FullName "signtool.exe"
+    $MsixName = "RShell-$SemVer-$Architecture.msix"
+    $MsixPath = Join-Path $BundleInputDir $MsixName
+    & $MakeAppx pack /d $PackageDir /p $MsixPath /o
+    Assert-NativeSuccess "Creating MSIX"
+
+    $BundleName = "RShell-$SemVer.msixbundle"
+    $CandidateBundlePath = Join-Path $StageDir $BundleName
+    & $MakeAppx bundle /d $BundleInputDir /p $CandidateBundlePath /o
+    Assert-NativeSuccess "Creating MSIX bundle"
+
+    if ($env:RSHELL_WINDOWS_CERT_SHA1) {
+        & $SignTool sign /fd SHA256 /td SHA256 /tr "http://timestamp.digicert.com" `
+            /sha1 $env:RSHELL_WINDOWS_CERT_SHA1 $CandidateBundlePath
+        Assert-NativeSuccess "Signing MSIX bundle"
+    } elseif ($env:RSHELL_WINDOWS_PFX_PATH -and $env:RSHELL_WINDOWS_PFX_PASSWORD) {
+        & $SignTool sign /fd SHA256 /td SHA256 /tr "http://timestamp.digicert.com" `
+            /f $env:RSHELL_WINDOWS_PFX_PATH /p $env:RSHELL_WINDOWS_PFX_PASSWORD $CandidateBundlePath
+        Assert-NativeSuccess "Signing MSIX bundle"
+    } else {
+        throw "Set RSHELL_WINDOWS_CERT_SHA1 or the PFX path/password; unsigned update packages are never copied to dist"
+    }
+    & $SignTool verify /pa /v $CandidateBundlePath
+    Assert-NativeSuccess "Verifying MSIX bundle signature"
+
+    # Only a successfully signed and verified bundle may enter the publishing directory.
+    $BundlePath = Join-Path $DistDir $BundleName
+    Copy-Item -Force $CandidateBundlePath $BundlePath
+
+    $BundleUrl = "$ReleaseBaseUrl/$BundleName"
+    $AppInstallerUrl = "$ReleaseBaseUrl/RShell.appinstaller"
+    $AppInstaller = Get-Content (Join-Path $PSScriptRoot "RShell.appinstaller") -Raw
+    $AppInstaller = $AppInstaller.Replace("__PACKAGE_NAME__", [Security.SecurityElement]::Escape($PackageName))
+    $AppInstaller = $AppInstaller.Replace("__PUBLISHER__", [Security.SecurityElement]::Escape($Publisher))
+    $AppInstaller = $AppInstaller.Replace("__VERSION__", $PackageVersion)
+    $AppInstaller = $AppInstaller.Replace("__APPINSTALLER_URL__", [Security.SecurityElement]::Escape($AppInstallerUrl))
+    $AppInstaller = $AppInstaller.Replace("__BUNDLE_URL__", [Security.SecurityElement]::Escape($BundleUrl))
+    Set-Content (Join-Path $DistDir "RShell.appinstaller") $AppInstaller -Encoding utf8
+
+    Write-Host "Created $BundlePath"
+    Write-Host "Created $(Join-Path $DistDir 'RShell.appinstaller')"
+} finally {
+    if (Test-Path $StageDir) { Remove-Item -Recurse -Force $StageDir }
+}

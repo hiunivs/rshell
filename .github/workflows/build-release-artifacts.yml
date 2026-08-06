@@ -1,0 +1,235 @@
+name: Build signed release artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: Monotonically increasing build number (1-65535)
+        required: true
+        type: number
+      macos_appcast_url:
+        description: Stable macOS appcast HTTPS URL
+        required: true
+        type: string
+      macos_beta_appcast_url:
+        description: Optional beta macOS appcast HTTPS URL
+        required: false
+        type: string
+      macos_release_channel:
+        description: macOS appcast artifact channel
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - beta
+      windows_update_base_url:
+        description: Stable Windows update HTTPS directory
+        required: true
+        type: string
+      windows_beta_update_base_url:
+        description: Optional beta Windows update HTTPS directory
+        required: false
+        type: string
+      windows_release_channel:
+        description: Windows artifact channel
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - beta
+      windows_publisher:
+        description: Exact MSIX certificate subject, for example CN=Example
+        required: true
+        type: string
+      windows_publisher_display_name:
+        description: Publisher name shown by App Installer
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    name: macOS universal (signed and notarized)
+    runs-on: macos-15
+    environment: release
+    env:
+      RSHELL_BUILD_NUMBER: ${{ inputs.build_number }}
+      RSHELL_MACOS_APPCAST_URL: ${{ inputs.macos_appcast_url }}
+      RSHELL_MACOS_BETA_APPCAST_URL: ${{ inputs.macos_beta_appcast_url }}
+      RSHELL_MACOS_RELEASE_CHANNEL: ${{ inputs.macos_release_channel }}
+      RSHELL_SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
+      RSHELL_MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      RSHELL_APPLE_NOTARY_PROFILE: RShellNotary
+      SPARKLE_VERSION: ${{ vars.SPARKLE_VERSION }}
+      SPARKLE_SHA256: ${{ vars.SPARKLE_SHA256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust targets
+        shell: bash
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Validate release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RSHELL_MACOS_APPCAST_URL" == https://*/appcast.xml ]]
+          if [[ "$RSHELL_MACOS_RELEASE_CHANNEL" == beta ]]; then
+            [[ "$RSHELL_MACOS_BETA_APPCAST_URL" == https://*/appcast.xml ]]
+          fi
+          [[ -n "$SPARKLE_VERSION" ]]
+          [[ "$SPARKLE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]
+          [[ -n "$RSHELL_SPARKLE_PUBLIC_KEY" ]]
+          [[ -n "$RSHELL_MACOS_SIGN_IDENTITY" ]]
+
+      - name: Download and verify pinned Sparkle distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz" \
+            --output "$RUNNER_TEMP/Sparkle.tar.xz"
+          echo "$SPARKLE_SHA256  $RUNNER_TEMP/Sparkle.tar.xz" | shasum -a 256 --check
+          mkdir "$RUNNER_TEMP/Sparkle"
+          tar -xJf "$RUNNER_TEMP/Sparkle.tar.xz" -C "$RUNNER_TEMP/Sparkle"
+          test -d "$RUNNER_TEMP/Sparkle/Sparkle.framework"
+          test -x "$RUNNER_TEMP/Sparkle/bin/generate_appcast"
+          echo "SPARKLE_FRAMEWORK_PATH=$RUNNER_TEMP/Sparkle/Sparkle.framework" >> "$GITHUB_ENV"
+          echo "SPARKLE_BIN_DIR=$RUNNER_TEMP/Sparkle/bin" >> "$GITHUB_ENV"
+
+      - name: Import release credentials into temporary keychain
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          RELEASE_KEYCHAIN_PASSWORD: ${{ secrets.RELEASE_KEYCHAIN_PASSWORD }}
+          SPARKLE_PRIVATE_KEY_BASE64: ${{ secrets.SPARKLE_PRIVATE_KEY_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/rshell-release.keychain-db"
+          CERTIFICATE="$RUNNER_TEMP/rshell-release.p12"
+          SPARKLE_KEY="$RUNNER_TEMP/sparkle-private-key"
+          printf '%s' "$MACOS_CERTIFICATE_BASE64" | openssl base64 -d -A -out "$CERTIFICATE"
+          printf '%s' "$SPARKLE_PRIVATE_KEY_BASE64" | openssl base64 -d -A -out "$SPARKLE_KEY"
+          chmod 600 "$SPARKLE_KEY"
+          security create-keychain -p "$RELEASE_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$RELEASE_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERTIFICATE" -k "$KEYCHAIN" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$RELEASE_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security default-keychain -d user -s "$KEYCHAIN"
+          "$SPARKLE_BIN_DIR/generate_keys" -f "$SPARKLE_KEY"
+          xcrun notarytool store-credentials "$RSHELL_APPLE_NOTARY_PROFILE" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" \
+            --keychain "$KEYCHAIN"
+          echo "RSHELL_RELEASE_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "RSHELL_APPLE_NOTARY_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Build, sign and notarize macOS app
+        shell: bash
+        run: ./packaging/macos/package.sh
+
+      - name: Generate signed channel appcast
+        shell: bash
+        env:
+          INPUT_MACOS_RELEASE_CHANNEL: ${{ inputs.macos_release_channel }}
+          INPUT_MACOS_STABLE_APPCAST_URL: ${{ inputs.macos_appcast_url }}
+          INPUT_MACOS_BETA_APPCAST_URL: ${{ inputs.macos_beta_appcast_url }}
+        run: |
+          set -euo pipefail
+          if [[ "$INPUT_MACOS_RELEASE_CHANNEL" == beta ]]; then
+            FEED_URL="$INPUT_MACOS_BETA_APPCAST_URL"
+          else
+            FEED_URL="$INPUT_MACOS_STABLE_APPCAST_URL"
+          fi
+          [[ "$FEED_URL" == https://*/appcast.xml ]]
+          RSHELL_MACOS_DOWNLOAD_PREFIX="${FEED_URL%/appcast.xml}"
+          export RSHELL_MACOS_DOWNLOAD_PREFIX
+          ./packaging/macos/generate_appcast.sh
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rshell-macos-${{ inputs.macos_release_channel }}-${{ inputs.build_number }}
+          path: |
+            dist/macos/RShell-*.zip
+            dist/macos/appcast.xml
+            dist/macos/*.delta
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove temporary release keychain
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${RSHELL_RELEASE_KEYCHAIN:-}" && -f "$RSHELL_RELEASE_KEYCHAIN" ]]; then
+            security default-keychain -d user -s login.keychain-db
+            security delete-keychain "$RSHELL_RELEASE_KEYCHAIN"
+          fi
+
+  windows:
+    name: Windows x64 (signed MSIX)
+    runs-on: windows-2025
+    environment: release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust target
+        shell: pwsh
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Decode signing certificate
+        shell: pwsh
+        env:
+          WINDOWS_PFX_BASE64: ${{ secrets.WINDOWS_PFX_BASE64 }}
+        run: |
+          if (-not $env:WINDOWS_PFX_BASE64) { throw "WINDOWS_PFX_BASE64 is required" }
+          $Path = Join-Path $env:RUNNER_TEMP "rshell-release.pfx"
+          [IO.File]::WriteAllBytes($Path, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+          "RSHELL_WINDOWS_PFX_PATH=$Path" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build, sign and verify Windows package
+        shell: pwsh
+        env:
+          RSHELL_WINDOWS_PFX_PASSWORD: ${{ secrets.WINDOWS_PFX_PASSWORD }}
+          INPUT_BUILD_NUMBER: ${{ inputs.build_number }}
+          INPUT_PUBLISHER: ${{ inputs.windows_publisher }}
+          INPUT_PUBLISHER_DISPLAY_NAME: ${{ inputs.windows_publisher_display_name }}
+          INPUT_UPDATE_BASE_URL: ${{ inputs.windows_update_base_url }}
+          INPUT_BETA_UPDATE_BASE_URL: ${{ inputs.windows_beta_update_base_url }}
+          INPUT_RELEASE_CHANNEL: ${{ inputs.windows_release_channel }}
+        run: |
+          $Parameters = @{
+            Architecture = "x64"
+            BuildNumber = [int]$env:INPUT_BUILD_NUMBER
+            Publisher = $env:INPUT_PUBLISHER
+            PublisherDisplayName = $env:INPUT_PUBLISHER_DISPLAY_NAME
+            UpdateBaseUrl = $env:INPUT_UPDATE_BASE_URL
+            ReleaseChannel = $env:INPUT_RELEASE_CHANNEL
+          }
+          if ($env:INPUT_BETA_UPDATE_BASE_URL) {
+            $Parameters.BetaUpdateBaseUrl = $env:INPUT_BETA_UPDATE_BASE_URL
+          }
+          ./packaging/windows/package.ps1 @Parameters
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rshell-windows-${{ inputs.windows_release_channel }}-${{ inputs.build_number }}
+          path: dist/windows/${{ inputs.windows_release_channel }}/*
+          if-no-files-found: error
+          retention-days: 14

@@ -498,7 +498,7 @@ impl RShellApp {
         let mut act: Option<(String, LibConnAction)> = None;
         for (row_index, c) in conns.into_iter().enumerate() {
             let sel = self.lib_conn.as_deref() == Some(&c.name);
-            let dn = c.display_name();
+            let (dn, host) = connection_list_identity(c);
             let kl = key_label(c, &self.config);
             let fill = if sel {
                 ui.visuals().selection.bg_fill.gamma_multiply(0.55)
@@ -519,6 +519,8 @@ impl RShellApp {
                         } else {
                             RichText::new(dn)
                         });
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(host).weak().size(9.0).monospace());
                         for t in &c.tags {
                             tag_chip(ui, t);
                         }
@@ -930,6 +932,7 @@ impl RShellApp {
         };
         if let Some(i) = self.config.connections.iter().position(|c| c.name == name) {
             let c = self.config.connections.remove(i);
+            self.config.remove_connection_usage(&c.name);
             crate::secrets::delete(&crate::secrets::account_for(&c.user, &c.host, c.port));
             let _ = crate::config::save(&self.config);
         }
@@ -1032,6 +1035,7 @@ impl RShellApp {
         if let Some(orig) = &self.lc_orig
             && orig != &new_name
         {
+            self.config.rename_connection_usage(orig, &new_name);
             self.config.connections.retain(|c| &c.name != orig);
             crate::secrets::delete(orig);
         }
@@ -2023,9 +2027,13 @@ fn key_label(c: &crate::config::SavedConnection, cfg: &crate::config::AppConfig)
     }
 }
 
+fn connection_list_identity(c: &crate::config::SavedConnection) -> (&str, &str) {
+    (c.display_name(), c.host.as_str())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{folder_name, folder_parent, folder_tree_paths};
+    use super::{connection_list_identity, folder_name, folder_parent, folder_tree_paths};
 
     #[test]
     fn folder_tree_parts_reflect_path_hierarchy() {
@@ -2046,6 +2054,21 @@ mod tests {
                 "生产/华东".to_string(),
                 "生产/华东/Web".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn connection_list_shows_alias_and_host_separately() {
+        let connection = crate::config::SavedConnection {
+            name: "root@10.0.0.8:22".into(),
+            host: "10.0.0.8".into(),
+            alias: "生产服务器".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            connection_list_identity(&connection),
+            ("生产服务器", "10.0.0.8")
         );
     }
 }

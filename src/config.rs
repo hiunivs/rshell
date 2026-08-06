@@ -187,6 +187,43 @@ pub struct ShortcutSettings {
     pub right_click_paste: bool,
 }
 
+/// 更新源。各通道使用独立、编译期固定的 HTTPS 地址，避免运行时接受任意源。
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Beta,
+}
+
+impl UpdateChannel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "稳定版",
+            Self::Beta => "测试版",
+        }
+    }
+}
+
+/// 软件更新设置。自动检查目前由 Sparkle 管理；Windows 的检查周期由
+/// `.appinstaller` 中的 OnLaunch 策略管理。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct UpdateSettings {
+    pub channel: UpdateChannel,
+    pub automatic_checks: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            channel: UpdateChannel::Stable,
+            // 首次安装不静默开启联网检查，由用户在设置中明确启用。
+            automatic_checks: false,
+        }
+    }
+}
+
 /// 下载路径的选择方式。
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -317,10 +354,21 @@ pub struct SavedCommand {
     pub command: String,
 }
 
+/// 已保存连接的本地使用统计，仅用于“常用”排序。
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ConnectionUsage {
+    pub name: String,
+    pub connect_count: u64,
+    pub last_connected_at: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct AppConfig {
     pub connections: Vec<SavedConnection>,
+    /// 已保存连接的使用统计；与连接主体分离，导入导出连接时不会携带。
+    pub connection_usage: Vec<ConnectionUsage>,
     /// 显式存在的文件夹路径集合(含空文件夹)
     pub folders: Vec<String>,
     /// 受管理的密钥
@@ -341,6 +389,8 @@ pub struct AppConfig {
     pub editor: EditorSettings,
     /// 鼠标与键盘快捷操作。
     pub shortcuts: ShortcutSettings,
+    /// 软件更新通道与自动检查选项。
+    pub updates: UpdateSettings,
     /// 文件上传/下载设置。
     pub transfers: TransferSettings,
     /// 上次退出时主窗口内容区域的宽度和高度。
@@ -356,6 +406,104 @@ impl AppConfig {
             Some([width, height])
         } else {
             None
+        }
+    }
+
+    /// 记录一次已保存连接的打开行为。连接不存在时不产生孤立统计项。
+    pub fn record_connection_use(&mut self, name: &str) -> bool {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.record_connection_use_at(name, timestamp)
+    }
+
+    fn record_connection_use_at(&mut self, name: &str, timestamp: u64) -> bool {
+        if !self
+            .connections
+            .iter()
+            .any(|connection| connection.name == name)
+        {
+            return false;
+        }
+        if let Some(usage) = self
+            .connection_usage
+            .iter_mut()
+            .find(|usage| usage.name == name)
+        {
+            usage.connect_count = usage.connect_count.saturating_add(1);
+            usage.last_connected_at = timestamp;
+        } else {
+            self.connection_usage.push(ConnectionUsage {
+                name: name.to_string(),
+                connect_count: 1,
+                last_connected_at: timestamp,
+            });
+        }
+        true
+    }
+
+    /// 按连接次数、最近连接时间依次降序返回常用连接。
+    pub fn frequent_connections(&self, limit: usize) -> Vec<&SavedConnection> {
+        let mut ranked = self
+            .connections
+            .iter()
+            .filter_map(|connection| {
+                self.connection_usage
+                    .iter()
+                    .find(|usage| usage.name == connection.name && usage.connect_count > 0)
+                    .map(|usage| (connection, usage))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(
+            |(left_connection, left_usage), (right_connection, right_usage)| {
+                right_usage
+                    .connect_count
+                    .cmp(&left_usage.connect_count)
+                    .then_with(|| {
+                        right_usage
+                            .last_connected_at
+                            .cmp(&left_usage.last_connected_at)
+                    })
+                    .then_with(|| left_connection.name.cmp(&right_connection.name))
+            },
+        );
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|(connection, _)| connection)
+            .collect()
+    }
+
+    pub fn remove_connection_usage(&mut self, name: &str) {
+        self.connection_usage.retain(|usage| usage.name != name);
+    }
+
+    pub fn rename_connection_usage(&mut self, old_name: &str, new_name: &str) {
+        if old_name == new_name {
+            return;
+        }
+        let Some(old_index) = self
+            .connection_usage
+            .iter()
+            .position(|usage| usage.name == old_name)
+        else {
+            return;
+        };
+        let mut old_usage = self.connection_usage.remove(old_index);
+        if let Some(new_usage) = self
+            .connection_usage
+            .iter_mut()
+            .find(|usage| usage.name == new_name)
+        {
+            new_usage.connect_count = new_usage
+                .connect_count
+                .saturating_add(old_usage.connect_count);
+            new_usage.last_connected_at =
+                new_usage.last_connected_at.max(old_usage.last_connected_at);
+        } else {
+            old_usage.name = new_name.to_string();
+            self.connection_usage.push(old_usage);
         }
     }
 }
@@ -450,11 +598,20 @@ mod tests {
             key_path: "~/.ssh/id_rsa".into(),
             ..Default::default()
         });
+        assert!(cfg.record_connection_use_at("root@example.com", 123));
         let text = toml::to_string_pretty(&cfg).unwrap();
         let parsed: AppConfig = toml::from_str(&text).unwrap();
         assert_eq!(parsed.connections.len(), 1);
         assert_eq!(parsed.connections[0].host, "example.com");
         assert_eq!(parsed.connections[0].port, 22);
+        assert_eq!(
+            parsed.connection_usage,
+            vec![ConnectionUsage {
+                name: "root@example.com".into(),
+                connect_count: 1,
+                last_connected_at: 123,
+            }]
+        );
     }
 
     /// 旧格式 toml(只有旧连接字段,无 alias/group/tags/key_id,无 folders/keys)
@@ -480,6 +637,7 @@ key_path = ""
         assert!(cfg.folders.is_empty());
         assert!(cfg.keys.is_empty());
         assert!(cfg.common_commands.is_empty());
+        assert!(cfg.connection_usage.is_empty());
         assert!(cfg.window_size().is_none());
         assert_eq!(cfg.password_storage, PasswordStorage::AppEncrypted);
         assert_eq!(cfg.terminal_background.kind, TerminalBackgroundKind::Solid);
@@ -490,6 +648,8 @@ key_path = ""
         assert!(!cfg.editor.remember_open_files);
         assert!(!cfg.editor.auto_wrap);
         assert!(!cfg.shortcuts.right_click_paste);
+        assert_eq!(cfg.updates.channel, UpdateChannel::Stable);
+        assert!(!cfg.updates.automatic_checks);
         assert_eq!(cfg.transfers.download_mode, DownloadPathMode::AskEachTime);
         assert!(cfg.transfers.download_dir.is_empty());
     }
@@ -593,5 +753,68 @@ key_path = ""
             ..Default::default()
         };
         assert_eq!(connection.session_title(), "admin@10.0.0.8");
+    }
+
+    #[test]
+    fn frequent_connections_rank_by_count_then_recency_and_limit() {
+        let mut cfg = AppConfig {
+            connections: ["a", "b", "c", "d"]
+                .into_iter()
+                .map(|name| SavedConnection {
+                    name: name.into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        for timestamp in [5, 20, 30] {
+            assert!(cfg.record_connection_use_at("b", timestamp));
+        }
+        for timestamp in [10, 40] {
+            assert!(cfg.record_connection_use_at("a", timestamp));
+        }
+        assert!(cfg.record_connection_use_at("c", 50));
+        assert!(cfg.record_connection_use_at("d", 60));
+        assert!(!cfg.record_connection_use_at("missing", 70));
+
+        assert_eq!(
+            cfg.frequent_connections(3)
+                .into_iter()
+                .map(|connection| connection.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a", "d"]
+        );
+        assert!(
+            !cfg.connection_usage
+                .iter()
+                .any(|usage| usage.name == "missing")
+        );
+    }
+
+    #[test]
+    fn connection_usage_follows_renames_and_deletions() {
+        let mut cfg = AppConfig {
+            connections: ["old", "new"]
+                .into_iter()
+                .map(|name| SavedConnection {
+                    name: name.into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(cfg.record_connection_use_at("old", 20));
+        assert!(cfg.record_connection_use_at("old", 30));
+        assert!(cfg.record_connection_use_at("new", 10));
+
+        cfg.rename_connection_usage("old", "new");
+        assert_eq!(cfg.connection_usage.len(), 1);
+        assert_eq!(cfg.connection_usage[0].name, "new");
+        assert_eq!(cfg.connection_usage[0].connect_count, 3);
+        assert_eq!(cfg.connection_usage[0].last_connected_at, 30);
+
+        cfg.remove_connection_usage("new");
+        assert!(cfg.connection_usage.is_empty());
     }
 }

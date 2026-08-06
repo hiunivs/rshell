@@ -394,6 +394,7 @@ impl RShellApp {
         if let Some(old) = old_account
             && old != new_account
         {
+            self.config.rename_connection_usage(&old, &new_account);
             crate::secrets::delete(&old);
             self.config.connections.retain(|c| c.name != old);
         }

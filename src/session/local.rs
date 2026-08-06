@@ -53,7 +53,7 @@ pub fn spawn(cols: u16, rows: u16, ctx: egui::Context) -> anyhow::Result<Session
     let master = pair.master;
 
     let (cmd_tx, mut cmd_rx) = cmd_channel();
-    let (data_tx, data_rx) = data_channel();
+    let (data_tx, data_rx) = data_channel(ctx.clone());
     let (event_tx, event_rx) = channel::<SessionEvent>();
 
     // 文件服务线程(本机目录浏览/文件操作)
@@ -74,7 +74,6 @@ pub fn spawn(cols: u16, rows: u16, ctx: egui::Context) -> anyhow::Result<Session
                     if data_tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
-                    ctx.request_repaint();
                 }
                 Err(_) => {
                     let _ = event_tx.send(SessionEvent::Exited);
@@ -118,6 +117,7 @@ pub fn spawn(cols: u16, rows: u16, ctx: egui::Context) -> anyhow::Result<Session
         data_rx,
         event_rx,
         sftp_tx,
+        monitor_active_tx: None,
     })
 }
 

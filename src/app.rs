@@ -120,7 +120,7 @@ impl Session {
     pub fn launcher(seq: usize) -> Self {
         Self {
             id: seq,
-            title: format!("{seq} 新建连接"),
+            title: "新建连接".into(),
             kind: SessionKind::Launcher,
             host: String::new(),
             term: None,
@@ -261,7 +261,12 @@ impl Session {
                     let d = term.dims();
                     match crate::session::local::spawn(d.cols as u16, d.rows as u16, ctx.clone()) {
                         Ok(ch) => {
-                            term.reconnect(ch.cmd_tx, ch.data_rx, ch.event_rx);
+                            term.reconnect(
+                                ch.cmd_tx,
+                                ch.data_rx,
+                                ch.event_rx,
+                                ch.monitor_active_tx,
+                            );
                             self.fm = FileManager::new(Some(ch.sftp_tx));
                             self.error = None;
                             return;
@@ -297,7 +302,7 @@ impl Session {
                         d.rows as u16,
                         ctx.clone(),
                     );
-                    term.reconnect(ch.cmd_tx, ch.data_rx, ch.event_rx);
+                    term.reconnect(ch.cmd_tx, ch.data_rx, ch.event_rx, ch.monitor_active_tx);
                     self.fm = FileManager::new_ssh(Some(ch.sftp_tx));
                     self.error = None;
                 } else {
@@ -312,6 +317,18 @@ impl Session {
             SessionKind::SysInfo(_) => {}
         }
     }
+}
+
+/// 将最近创建且仍为空白的 SSH 启动页移动到标签末尾，并返回其新下标。
+fn move_existing_launcher_to_end(sessions: &mut Vec<Session>) -> Option<usize> {
+    let launcher_index = sessions
+        .iter()
+        .rposition(|session| session.kind == SessionKind::Launcher)?;
+    if launcher_index + 1 < sessions.len() {
+        let launcher = sessions.remove(launcher_index);
+        sessions.push(launcher);
+    }
+    Some(sessions.len() - 1)
 }
 
 /// 底部文件管理器面板选中的页签
@@ -369,6 +386,8 @@ pub struct RShellApp {
     pub settings_sub: Option<crate::ui::settings::SettingsPage>,
     /// 设置保存/迁移错误
     pub settings_error: Option<String>,
+    /// 平台原生的软件更新后端及最近一次状态。
+    pub(crate) updater: crate::update::UpdateManager,
     /// 终端背景图纹理缓存；路径改变时重新加载。
     pub(crate) terminal_background_texture: Option<TerminalBackgroundTexture>,
     /// 已经尝试过加载的路径，避免无效路径每帧反复读盘。
@@ -481,10 +500,12 @@ impl RShellApp {
         crate::ui::settings::apply_native_window_theme(&cc.egui_ctx, loaded_config.theme_mode);
         crate::ui::settings::apply_color_scheme(&cc.egui_ctx, loaded_config.color_scheme);
         crate::secrets::configure(loaded_config.password_storage);
+        let updater = crate::update::UpdateManager::new(&loaded_config.updates);
         let config_load_error = config::take_load_error();
         let (local_metrics_tx, local_metrics_rx) = mpsc::sync_channel(1);
         let local_sampling_enabled = Arc::new(AtomicBool::new(false));
         let sampler_enabled = Arc::downgrade(&local_sampling_enabled);
+        let sampler_ctx = cc.egui_ctx.clone();
         std::thread::spawn(move || {
             let mut sampler = LocalSampler::default();
             while let Some(enabled) = sampler_enabled.upgrade() {
@@ -495,7 +516,8 @@ impl RShellApp {
                 }
                 drop(enabled);
                 match local_metrics_tx.try_send(Arc::new(sampler.sample())) {
-                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                    Ok(()) => sampler_ctx.request_repaint(),
+                    Err(mpsc::TrySendError::Full(_)) => {}
                     Err(mpsc::TrySendError::Disconnected(_)) => break,
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -535,6 +557,7 @@ impl RShellApp {
             show_settings: false,
             settings_sub: None,
             settings_error: None,
+            updater,
             terminal_background_texture: None,
             terminal_background_load_attempt: None,
             terminal_background_rx: None,
@@ -626,6 +649,10 @@ impl RShellApp {
 
     /// 新建 SSH 会话标签
     pub fn open_ssh(&mut self, ctx: &egui::Context, params: SshParams) {
+        let connection_name = crate::secrets::account_for(&params.user, &params.host, params.port);
+        if self.config.record_connection_use(&connection_name) {
+            let _ = crate::config::save(&self.config);
+        }
         if self
             .sessions
             .get(self.active)
@@ -641,8 +668,12 @@ impl RShellApp {
         self.active = self.sessions.len() - 1;
     }
 
-    /// 新建一个保存连接选择标签。
+    /// 激活已有 SSH 启动页；不存在时才新建。
     pub fn open_ssh_launcher(&mut self) {
+        if let Some(index) = move_existing_launcher_to_end(&mut self.sessions) {
+            self.active = index;
+            return;
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
         self.sessions.push(Session::launcher(seq));
@@ -746,9 +777,13 @@ impl eframe::App for RShellApp {
                 .show(ui, |_ui| {});
         }
 
-        // 1. 喂所有会话的终端数据,取走监控指标与文件服务事件
-        for session in &mut self.sessions {
+        // 1. 喂所有会话的终端数据,取走监控指标与文件服务事件。只有当前实际
+        // 展示的会话（系统信息页映射到其源会话）保持 1 秒监控频率，
+        // 其余会话暂停监控并在重新激活时立即采样。
+        let monitored_idx = self.effective_session_idx();
+        for (idx, session) in self.sessions.iter_mut().enumerate() {
             if let Some(term) = session.term.as_mut() {
+                term.set_monitor_active(monitored_idx == Some(idx));
                 term.poll();
                 if let Some(m) = term.take_metrics() {
                     session.monitor.update(m);
@@ -763,7 +798,11 @@ impl eframe::App for RShellApp {
             session.fm.tick();
         }
         // 2. 本机指标由后台线程采样，UI 线程只消费最新快照。
-        let has_local = self.sessions.iter().any(|s| s.kind == SessionKind::Local);
+        let has_local = monitored_idx.is_some_and(|idx| {
+            self.sessions
+                .get(idx)
+                .is_some_and(|session| session.kind == SessionKind::Local)
+        });
         self.local_sampling_enabled
             .store(has_local, Ordering::Relaxed);
         let latest_metrics = self.local_metrics_rx.try_iter().last();
@@ -774,12 +813,6 @@ impl eframe::App for RShellApp {
                 }
             }
         }
-        // 监控采样不再由每个会话分别唤醒 UI；所有会话合并为每秒一次。
-        if self.sessions.iter().any(|session| session.term.is_some()) {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs(1));
-        }
-
         // 3. 顺序决定区域划分：左侧栏(满高)->右上标签栏->底部文件区->中央内容。
         // 系统信息页和 SSH 新建连接页使用完整的中央高度，不显示底部文件窗口。
         self.show_sidebar(ui);
@@ -821,10 +854,59 @@ mod tests {
     fn launcher_is_a_connectionless_tab() {
         let session = Session::launcher(7);
         assert!(session.kind == SessionKind::Launcher);
-        assert_eq!(session.title, "7 新建连接");
+        assert_eq!(session.title, "新建连接");
         assert!(session.term.is_none());
         assert!(!session.is_connected());
         assert!(session.ssh_params().is_none());
+    }
+
+    #[test]
+    fn existing_launcher_moves_to_the_end_instead_of_duplicating() {
+        let mut sessions = vec![
+            Session::launcher(10),
+            Session::launcher(20),
+            Session::launcher(30),
+            Session::launcher(40),
+        ];
+        sessions[1].kind = SessionKind::Ssh;
+        sessions[1].title = "ssh-a".into();
+        sessions[3].kind = SessionKind::Ssh;
+        sessions[3].title = "ssh-b".into();
+
+        assert_eq!(move_existing_launcher_to_end(&mut sessions), Some(3));
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![10, 20, 40, 30]
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|session| session.kind == SessionKind::Launcher)
+                .count(),
+            2
+        );
+
+        assert_eq!(move_existing_launcher_to_end(&mut sessions), Some(3));
+        assert_eq!(sessions.last().map(|session| session.id), Some(30));
+    }
+
+    #[test]
+    fn launcher_move_returns_none_when_all_tabs_are_connected() {
+        let mut sessions = vec![Session::launcher(1), Session::launcher(2)];
+        for session in &mut sessions {
+            session.kind = SessionKind::Ssh;
+        }
+        assert_eq!(move_existing_launcher_to_end(&mut sessions), None);
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 
     /// 断开 → 未连接(网格保留);重连 → 恢复连接(本机会话起真实 pty)

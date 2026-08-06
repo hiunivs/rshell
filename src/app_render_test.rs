@@ -67,6 +67,49 @@ mod tests {
         eprintln!("saved /tmp/rshell_library.png");
     }
 
+    #[test]
+    fn launcher_group_header_stays_close_to_its_cards() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| RShellApp::new(cc));
+        harness.set_size(egui::vec2(1280.0, 800.0));
+        harness.state_mut().config.connections = vec![crate::config::SavedConnection {
+            name: "layout-test".into(),
+            alias: "布局测试连接".into(),
+            host: "10.0.0.1".into(),
+            user: "root".into(),
+            group: "布局测试目录".into(),
+            ..Default::default()
+        }];
+        harness.run_steps(3);
+
+        let header = harness.get_by_label("布局测试目录").rect();
+        let connection = harness.get_by_label("布局测试连接").rect();
+        assert!(
+            connection.top() - header.bottom() < 40.0,
+            "directory header left a large gap before its cards: header={header:?}, card={connection:?}"
+        );
+    }
+
+    #[test]
+    fn software_update_settings_render_in_development_builds() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            RShellApp::new_with_config(cc, crate::config::AppConfig::default())
+        });
+        harness.set_size(egui::vec2(1280.0, 800.0));
+        {
+            let app = harness.state_mut();
+            app.show_settings = true;
+            app.settings_sub = Some(crate::ui::settings::SettingsPage::Updates);
+        }
+        harness.run_steps(3);
+
+        assert!(harness.get_by_label("版本与更新").rect().is_positive());
+        assert!(harness.get_by_label("检查更新").rect().is_positive());
+    }
+
     /// 渲染多连接标签栏:验证自绘标签块(× 在左,选中高亮,块间间隙)
     #[test]
     #[ignore]

@@ -15,6 +15,7 @@ mod session;
 mod storage;
 mod term_view;
 mod ui;
+mod update;
 
 fn main() -> eframe::Result<()> {
     let loaded_config = config::load();
