@@ -149,10 +149,14 @@ try {
         }
     }
 
-    $SdkBin = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    $SdkBin = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64" -Directory |
+        Where-Object { Test-Path (Join-Path $_.FullName "makeappx.exe") } |
+        Sort-Object { [version]$_.Parent.Name } -Descending |
+        Select-Object -First 1
     if (-not $SdkBin) { throw "Windows SDK tools were not found" }
     $MakeAppx = Join-Path $SdkBin.FullName "makeappx.exe"
     $SignTool = Join-Path $SdkBin.FullName "signtool.exe"
+    if (-not (Test-Path $SignTool)) { throw "signtool.exe was not found next to makeappx.exe in $($SdkBin.FullName)" }
     $MsixName = "RShell-$SemVer-$Architecture.msix"
     $MsixPath = Join-Path $BundleInputDir $MsixName
     & $MakeAppx pack /d $PackageDir /p $MsixPath /o
