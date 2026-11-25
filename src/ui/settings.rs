@@ -645,8 +645,8 @@ impl RShellApp {
             }
             ui.label(
                 RichText::new("用于文件管理器的\"用本地程序打开\"；远程文件会先下载到临时目录，保存后自动传回")
-                    .weak()
-                    .small(),
+                    .color(ui.visuals().weak_text_color())
+                    .size(11.0),
             );
         });
 
@@ -834,7 +834,11 @@ impl RShellApp {
             } else {
                 "当前平台没有配置原生更新后端。"
             };
-            ui.label(RichText::new(detail).weak().small());
+            ui.label(
+                RichText::new(detail)
+                    .color(ui.visuals().weak_text_color())
+                    .size(11.0),
+            );
         });
 
         self.show_settings_error(ui);
@@ -1020,7 +1024,11 @@ fn show_help_settings_page(ui: &mut Ui) {
             ("复制", "在终端中选中文字后，按 Ctrl+C 复制选区。"),
         ] {
             ui.label(RichText::new(title).strong());
-            ui.label(RichText::new(detail).weak().small());
+            ui.label(
+                RichText::new(detail)
+                    .color(ui.visuals().weak_text_color())
+                    .size(11.0),
+            );
             ui.add_space(8.0);
         }
     });
