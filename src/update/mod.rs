@@ -122,7 +122,8 @@ impl UpdateManager {
         match self.backend.check_for_updates(channel) {
             Ok(action) => {
                 self.status = match action {
-                    UpdateAction::Started => "正在由系统更新器检查…".to_owned(),
+                    // Sparkle 自带原生进度 UI，这里不再显示冗余的检查中小字。
+                    UpdateAction::Started => String::new(),
                     UpdateAction::OpenUrl(_) => "已打开 Windows 更新下载地址".to_owned(),
                 };
                 Ok(action)

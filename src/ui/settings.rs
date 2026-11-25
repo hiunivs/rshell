@@ -788,7 +788,8 @@ impl RShellApp {
                             .updater
                             .is_available(self.config.updates.channel);
                         ui.add_enabled_ui(channel_available, |ui| {
-                            ui.with_layout(
+                            ui.allocate_ui_with_layout(
+                                vec2(190.0, 28.0),
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if settings_toggle(ui, &mut automatic).changed() {
@@ -818,17 +819,16 @@ impl RShellApp {
             }
 
             ui.add_space(9.0);
-            let status_color = if enabled {
-                ui.visuals().weak_text_color()
-            } else {
-                Color32::from_rgb(0xD9, 0x78, 0x32)
-            };
-            ui.label(
-                RichText::new(self.updater.status())
-                    .color(status_color)
-                    .small(),
-            );
-            ui.add_space(5.0);
+            let status = self.updater.status();
+            if !status.is_empty() {
+                let status_color = if enabled {
+                    ui.visuals().weak_text_color()
+                } else {
+                    Color32::from_rgb(0xD9, 0x78, 0x32)
+                };
+                ui.label(RichText::new(status).color(status_color).small());
+                ui.add_space(5.0);
+            }
             let detail = if cfg!(target_os = "windows") {
                 "安装与回滚由 Windows App Installer 处理；自动检查周期由已签名的 .appinstaller 配置。"
             } else if cfg!(target_os = "macos") {
@@ -1024,23 +1024,35 @@ fn show_help_settings_page(ui: &mut Ui) {
     });
 }
 
+fn paint_rshell_logo(painter: &egui::Painter, rect: egui::Rect) {
+    // 与 packaging/macos/make_icon.swift 相同的 ">_" 几何,坐标按 1024 画布缩放。
+    let scale = rect.width() / 1024.0;
+    let map = |x: f32, y: f32| rect.min + vec2(x * scale, y * scale);
+    let green = Color32::from_rgb(0x6B, 0xDB, 0x8C);
+    painter.rect_filled(
+        rect,
+        CornerRadius::same((200.0 * scale) as u8),
+        Color32::from_rgb(0x1A, 0x1C, 0x26),
+    );
+    painter.add(egui::Shape::line(
+        vec![map(294.0, 364.0), map(504.0, 512.0), map(294.0, 660.0)],
+        egui::Stroke::new(76.0 * scale, green),
+    ));
+    painter.rect_filled(
+        egui::Rect::from_min_max(map(585.0, 630.0), map(805.0, 694.0)),
+        CornerRadius::same((16.0 * scale).max(1.0) as u8),
+        green,
+    );
+}
+
 fn show_about_settings_page(ui: &mut Ui) {
-    let accent = ui.visuals().selection.bg_fill;
     let secondary = ui.visuals().weak_text_color();
     settings_section_frame(ui).show(ui, |ui| {
         ui.set_width(396.0);
         ui.vertical_centered(|ui| {
             ui.add_space(10.0);
             let (logo_rect, _) = ui.allocate_exact_size(vec2(52.0, 52.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(logo_rect, CornerRadius::same(12), accent);
-            ui.painter().text(
-                logo_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "R",
-                egui::FontId::proportional(28.0),
-                Color32::WHITE,
-            );
+            paint_rshell_logo(ui.painter(), logo_rect);
             ui.add_space(9.0);
             ui.label(RichText::new("RShell").strong().size(22.0));
             ui.label(
