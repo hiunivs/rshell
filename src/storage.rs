@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 配置类文件的安全读写工具。
 //!
 //! 所有写入都先落到同目录临时文件，完成同步后再原子替换正式文件。

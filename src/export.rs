@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! SSH 连接 JSON 导出；支持明文和密码加密两种文件格式。
 
 use aes_gcm::aead::{Aead, Generate, KeyInit, Payload};
@@ -288,7 +292,8 @@ fn export_connection(
             name: key.map(|key| key.name.clone()),
             path: key.map(|key| key.path.clone()),
             fingerprint: key.map(|key| key.fingerprint.clone()),
-            passphrase: crate::secrets::get(&crate::keys::key_account(key_id)),
+            passphrase: crate::secrets::get(&crate::keys::key_account(key_id))
+                .map(|value| value.expose().to_owned()),
         }
     } else if connection.key_path.is_empty() {
         ExportAuth::Password {
@@ -296,7 +301,8 @@ fn export_connection(
                 &connection.user,
                 &connection.host,
                 connection.port,
-            )),
+            ))
+            .map(|value| value.expose().to_owned()),
         }
     } else {
         ExportAuth::PrivateKey {

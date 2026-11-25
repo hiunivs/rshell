@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 pub mod conn_library;
 pub mod connect_dialog;
 pub mod dialog;

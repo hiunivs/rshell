@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 终端视图:alacritty_terminal 负责终端模拟(网格/ANSI/滚回/选区),
 //! 这里负责 egui 渲染、键盘/IME 输入、鼠标选区与滚动。
 
@@ -16,7 +20,9 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, vec2};
 use crate::session::files::SftpEvent;
 use crate::session::monitor::SystemMetrics;
 use crate::session::ssh::SshParams;
-use crate::session::{self, CmdTx, DataRx, HostKeyPrompt, SessionCmd, SessionEvent};
+use crate::session::{
+    self, CmdTx, DataRx, HostKeyPrompt, KeyboardInteractivePrompt, SessionCmd, SessionEvent,
+};
 
 pub struct TermBackground {
     pub color: Color32,
@@ -43,7 +49,13 @@ struct BackgroundRun {
     color: Color32,
 }
 
-struct CachedTextRun {
+/// 一帧内排版好的文字 run。
+///
+/// Galley 持有字形在图集里的 UV 坐标，而 epaint 会在图集将满、切换主题
+/// (字体颜色转换函数变化)或重新安装字体时整体重建字体图集，旧 Galley 的
+/// 字形坐标随即失效 —— 表现为整屏文字变成随机字符/花屏。因此这里只缓存
+/// 终端网格聚合出的 run 文本，Galley 必须每帧重新排版。
+struct TextRunLayout {
     row: usize,
     start_col: usize,
     end_col: usize,
@@ -339,13 +351,15 @@ pub struct TermView {
     pending_sftp: Vec<SftpEvent>,
     /// poll() 收到的主机指纹确认请求,等 app 层取走
     pending_hostkey: Vec<HostKeyPrompt>,
+    /// poll() 收到的 Keyboard-Interactive/2FA 请求。
+    pending_keyboard_interactive: Vec<KeyboardInteractivePrompt>,
     /// 当前帧的文字 run；只复用 Vec 容量，不复用旧 run 内容和边界。
     render_runs: Vec<RenderRun>,
     /// 缓存的背景 run。终端内容/选区未变化时直接复用。
     background_runs: Vec<BackgroundRun>,
-    /// 已完成字体布局的文字 run。光标闪烁时只克隆 Galley 引用，不重新
-    /// 拼接字符串或执行 shaping。
-    cached_text_runs: Vec<CachedTextRun>,
+    /// 本帧排版好的文字 run。每帧重新执行 shaping：字体图集可能在任何一帧
+    /// 被 epaint 重建，跨帧复用旧 Galley 会让字形 UV 失效（花屏）。
+    text_runs: Vec<TextRunLayout>,
     render_cache_key: Option<RenderCacheKey>,
     render_revision: u64,
 }
@@ -422,9 +436,10 @@ impl TermView {
             pending_metrics: None,
             pending_sftp: Vec::new(),
             pending_hostkey: Vec::new(),
+            pending_keyboard_interactive: Vec::new(),
             render_runs: Vec::with_capacity(128),
             background_runs: Vec::with_capacity(64),
-            cached_text_runs: Vec::with_capacity(128),
+            text_runs: Vec::with_capacity(128),
             render_cache_key: None,
             render_revision: 0,
         }
@@ -444,6 +459,9 @@ impl TermView {
                 SessionEvent::Metrics(m) => self.pending_metrics = Some(m),
                 SessionEvent::Sftp(e) => self.pending_sftp.push(e),
                 SessionEvent::VerifyHostKey(p) => self.pending_hostkey.push(*p),
+                SessionEvent::KeyboardInteractive(prompt) => {
+                    self.pending_keyboard_interactive.push(*prompt);
+                }
             }
         }
 
@@ -479,6 +497,10 @@ impl TermView {
     /// 取走积压的主机指纹确认请求
     pub fn take_hostkey(&mut self) -> Vec<HostKeyPrompt> {
         std::mem::take(&mut self.pending_hostkey)
+    }
+
+    pub fn take_keyboard_interactive(&mut self) -> Vec<KeyboardInteractivePrompt> {
+        std::mem::take(&mut self.pending_keyboard_interactive)
     }
 
     /// 当前会话是否正在被主窗口/系统信息页展示。后台 SSH 标签暂停监控，
@@ -642,12 +664,18 @@ impl TermView {
                 .iter()
                 .any(|event| matches!(event, egui::Event::WindowFocused(true)))
         });
+        // 有弹窗打开时终端不抢焦点、不处理键盘：弹窗里的确认框可能没有可聚焦
+        // 控件，此时焦点会留在终端上，回车就会穿透到 shell。
+        let modal_blocked = crate::ui::dialog::modal_keyboard_blocked(ui.ctx());
         let focus_is_unclaimed = ui.memory(|memory| memory.focused().is_none());
+        let mut claimed_focus_this_frame = false;
         if window_has_focus
+            && !modal_blocked
             && (self.request_initial_focus || window_just_gained_focus || focus_is_unclaimed)
         {
             response.request_focus();
             self.request_initial_focus = false;
+            claimed_focus_this_frame = true;
         }
         let rect = response.rect.shrink2(vec2(6.0, 4.0));
         let painter = painter.with_clip_rect(rect);
@@ -722,7 +750,13 @@ impl TermView {
             }
         }
 
-        self.handle_keyboard(ui, &response);
+        // 本帧才抢到焦点时不要处理键盘事件:典型场景是文件面板里的弹窗(它
+        // 画在终端之前)刚用回车确认、把焦点交还出来,同一个回车事件还在
+        // 输入队列里。若这里照常处理,回车会既确认弹窗又送进 shell。
+        // 焦点本身照常拿回,从下一帧开始接收按键。弹窗打开期间同样完全暂停输入。
+        if !claimed_focus_this_frame && !modal_blocked {
+            self.handle_keyboard(ui, &response);
+        }
 
         self.show_selection_copy_button(ui, response.id, rect);
 
@@ -851,7 +885,11 @@ impl TermView {
                     }
                 }
 
-                let ch = if cell.flags.contains(Flags::HIDDEN) {
+                // alacritty 已经按终端制表位把 Tab 展开到网格，但首个格子仍可能
+                // 保留 `\t`。若把它交给 egui shaping，egui 会再次把它画成多个
+                // 空格，导致同一 run 的视觉宽度超过网格宽度；后续 ANSI 颜色 run
+                // 仍从正确的绝对列开始，于是看起来像文字相互覆盖。
+                let ch = if cell.flags.contains(Flags::HIDDEN) || cell.c.is_control() {
                     ' '
                 } else {
                     cell.c
@@ -895,24 +933,27 @@ impl TermView {
                 }
             }
 
-            self.cached_text_runs.clear();
-            for run in &self.render_runs {
-                if run.text.trim().is_empty() {
-                    continue;
-                }
-                self.cached_text_runs.push(CachedTextRun {
-                    row: run.row,
-                    start_col: run.start_col,
-                    end_col: run.end_col,
-                    fg: run.fg,
-                    flags: run.flags,
-                    galley: painter.layout_no_wrap(run.text.clone(), font.clone(), run.fg),
-                });
-            }
             self.render_cache_key = Some(cache_key);
         }
 
-        // 先统一绘制全部背景，再复用已 shaping 的 Galley 绘制文字。
+        // 无论终端内容是否变化，都重新用当前字体图集排版。egui/epaint 不会
+        // 通知应用图集已被重建，跨帧复用 Galley 会让整屏字形取到错误纹理区域。
+        self.text_runs.clear();
+        for run in &self.render_runs {
+            if run.text.trim().is_empty() {
+                continue;
+            }
+            self.text_runs.push(TextRunLayout {
+                row: run.row,
+                start_col: run.start_col,
+                end_col: run.end_col,
+                fg: run.fg,
+                flags: run.flags,
+                galley: painter.layout_no_wrap(run.text.clone(), font.clone(), run.fg),
+            });
+        }
+
+        // 先统一绘制全部背景，再绘制本帧排版好的文字。
         for run in &self.background_runs {
             let x = rect.left() + run.start_col as f32 * cell_w;
             let y = rect.top() + run.row as f32 * cell_h;
@@ -921,7 +962,7 @@ impl TermView {
             painter.rect_filled(run_rect, 0.0, run.color);
         }
 
-        for run in &self.cached_text_runs {
+        for run in &self.text_runs {
             let x = rect.left() + run.start_col as f32 * cell_w;
             let y = rect.top() + run.row as f32 * cell_h;
             let w = (run.end_col - run.start_col) as f32 * cell_w;
@@ -1070,7 +1111,10 @@ impl TermView {
 
         if response.drag_started_by(egui::PointerButton::Primary) {
             self.selection_copy_pos = None;
-            if let Some(pos) = response.interact_pointer_pos() {
+            // 锚点取按下瞬间的位置:interact_pointer_pos 是越过拖拽阈值后的
+            // 当前位置,快速起拖时可能已偏到相邻单元格。
+            let press_origin = ui.input(|input| input.pointer.press_origin());
+            if let Some(pos) = press_origin.or_else(|| response.interact_pointer_pos()) {
                 let point = to_point(pos);
                 self.term.selection =
                     Some(Selection::new(SelectionType::Simple, point, Side::Left));
@@ -1080,16 +1124,8 @@ impl TermView {
         } else if response.dragged_by(egui::PointerButton::Primary)
             && let (Some(anchor), Some(pos)) = (self.sel_anchor, response.interact_pointer_pos())
         {
-            let point = to_point(pos);
-            let side = if point < anchor {
-                Side::Left
-            } else {
-                Side::Right
-            };
-            if let Some(sel) = self.term.selection.as_mut() {
-                sel.update(point, side);
-                self.mark_render_dirty();
-            }
+            self.term.selection = Some(drag_selection(anchor, to_point(pos)));
+            self.mark_render_dirty();
         }
 
         if response.double_clicked()
@@ -1316,6 +1352,23 @@ fn flags_relevant(flags: Flags) -> Flags {
     flags & (Flags::UNDERLINE | Flags::STRIKEOUT)
 }
 
+/// 构造把两个端点单元格都包含在内的 Simple 选区。
+///
+/// alacritty `range_simple` 按 Anchor 的 Side 收端点:`end.side == Left` 会
+/// 剔除末尾单元格、`start.side == Right` 会剔除起始单元格。因此锚点的 Side
+/// 必须随拖拽方向变化:正拖时锚点是起点(Side::Left),反拖时锚点是终点
+/// (Side::Right)——否则反向拖选会丢掉按下时的那个字符。
+fn drag_selection(anchor: Point, point: Point) -> Selection {
+    let (anchor_side, point_side) = if point < anchor {
+        (Side::Right, Side::Left)
+    } else {
+        (Side::Left, Side::Right)
+    };
+    let mut selection = Selection::new(SelectionType::Simple, anchor, anchor_side);
+    selection.update(point, point_side);
+    selection
+}
+
 /// 拖选靠近上下边缘时的滚动方向和速度。向上滚回为正，向下为负。
 fn selection_autoscroll_lines(pointer_y: f32, rect: Rect, cell_h: f32) -> i32 {
     let edge = cell_h.max(1.0).min(rect.height() * 0.25);
@@ -1369,6 +1422,55 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// 回归:无论往哪个方向拖选,按下和释放所在的两个单元格都必须入选。
+    /// (alacritty `range_simple` 会剔除 side 朝内的端点;锚点 side 不随方向
+    /// 翻转时,反向拖选会丢掉按下时的字符。)
+    #[test]
+    fn drag_selection_includes_both_endpoint_cells_in_both_directions() {
+        use alacritty_terminal::index::Line;
+
+        let ctx = egui::Context::default();
+        let (cmd_tx, _cmd_rx) = session::cmd_channel();
+        let (_data_tx, data_rx) = session::data_channel(ctx.clone());
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let view = TermView::with_channels(
+            &ctx,
+            TermDims { cols: 80, rows: 24 },
+            cmd_tx,
+            data_rx,
+            event_rx,
+            None,
+        );
+
+        let anchor = Point::new(Line(0), Column(5));
+        // 正拖(向右/向下):5..=8 全部入选
+        let forward = drag_selection(anchor, Point::new(Line(0), Column(8)))
+            .to_range(&view.term)
+            .expect("forward selection");
+        assert_eq!(forward.start, anchor);
+        assert_eq!(forward.end, Point::new(Line(0), Column(8)));
+        // 反拖(向左/向上):锚点(按下的字符)不能丢,2..=5 全部入选
+        let reverse = drag_selection(anchor, Point::new(Line(0), Column(2)))
+            .to_range(&view.term)
+            .expect("reverse selection");
+        assert_eq!(reverse.start, Point::new(Line(0), Column(2)));
+        assert_eq!(reverse.end, anchor);
+        // 跨行反拖同样包含锚点
+        let reverse_up = drag_selection(
+            Point::new(Line(2), Column(5)),
+            Point::new(Line(0), Column(70)),
+        )
+        .to_range(&view.term)
+        .expect("reverse-up selection");
+        assert_eq!(reverse_up.end, Point::new(Line(2), Column(5)));
+        // 原地不动:选中锚点单格
+        let single = drag_selection(anchor, anchor)
+            .to_range(&view.term)
+            .expect("single-cell selection");
+        assert_eq!(single.start, anchor);
+        assert_eq!(single.end, anchor);
+    }
+
     #[test]
     fn selection_autoscroll_uses_terminal_scroll_direction() {
         let rect = Rect::from_min_max(Pos2::new(0.0, 10.0), Pos2::new(400.0, 210.0));
@@ -1414,6 +1516,143 @@ mod tests {
             visible_without_terminal_focus = view.cursor_blink_visible(ui, false);
         });
         assert!(!visible_without_terminal_focus);
+    }
+
+    /// 有弹窗打开时终端必须完全暂停键盘输入：确认框之类没有可聚焦控件的
+    /// 弹窗不会把焦点从终端拿走，回车/文字否则会直接执行在 shell 里。
+    #[test]
+    fn terminal_keyboard_is_blocked_while_a_dialog_is_open() {
+        let ctx = egui::Context::default();
+        crate::install_app_fonts(&ctx, "Hack");
+        let (cmd_tx, mut cmd_rx) = session::cmd_channel();
+        let (_data_tx, data_rx) = session::data_channel(ctx.clone());
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut view = TermView::with_channels(
+            &ctx,
+            TermDims { cols: 80, rows: 24 },
+            cmd_tx,
+            data_rx,
+            event_rx,
+            None,
+        );
+        let background = TermBackground {
+            color: BG,
+            image: None,
+            image_mode: crate::config::TerminalImageMode::Stretch,
+            image_darkness: 0,
+        };
+        let drain_inputs = |cmd_rx: &mut session::CmdRx| {
+            let mut inputs = Vec::new();
+            while let Ok(command) = cmd_rx.try_recv() {
+                if let SessionCmd::Input(bytes) = command {
+                    inputs.push(bytes);
+                }
+            }
+            inputs
+        };
+
+        // 第 1 帧:终端获得初始焦点；弹窗(模拟画在终端之后)在本帧末尾出现。
+        view.request_initial_focus = true;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            view.show(ui, &background, 13.0, false);
+            crate::ui::dialog::mark_modal(ui.ctx());
+        });
+        assert!(ctx.memory(|memory| memory.focused()).is_some());
+        let _ = drain_inputs(&mut cmd_rx);
+
+        // 第 2 帧:弹窗开着，回车不应写进 shell。
+        let mut enter_input = egui::RawInput::default();
+        enter_input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run_ui(enter_input, |ui| {
+            view.show(ui, &background, 13.0, false);
+            crate::ui::dialog::mark_modal(ui.ctx());
+        });
+        assert!(
+            drain_inputs(&mut cmd_rx).is_empty(),
+            "弹窗打开时回车不能写进 shell"
+        );
+
+        // 第 3 帧:弹窗已关闭，但标记保留一帧作为收尾保护。
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            view.show(ui, &background, 13.0, false);
+        });
+        // 第 4 帧:保护帧过去后恢复正常输入。
+        let mut typed_input = egui::RawInput::default();
+        typed_input.events.push(egui::Event::Text("x".into()));
+        let _ = ctx.run_ui(typed_input, |ui| {
+            view.show(ui, &background, 13.0, false);
+        });
+        assert_eq!(
+            drain_inputs(&mut cmd_rx),
+            vec![b"x".to_vec()],
+            "弹窗关闭后终端应恢复接收按键"
+        );
+    }
+
+    /// 回归:文件面板弹窗画在终端之前。弹窗里的单行文本框用回车确认时会交出
+    /// 焦点,随后绘制的终端会立即抢回焦点——但同一个回车事件不能被终端再处理
+    /// 一次,否则弹窗确认和 shell 回车会同时发生。
+    #[test]
+    fn terminal_does_not_consume_enter_that_confirmed_a_dialog() {
+        let ctx = egui::Context::default();
+        crate::install_app_fonts(&ctx, "Hack");
+        let (cmd_tx, mut cmd_rx) = session::cmd_channel();
+        let (_data_tx, data_rx) = session::data_channel(ctx.clone());
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut view = TermView::with_channels(
+            &ctx,
+            TermDims { cols: 80, rows: 24 },
+            cmd_tx,
+            data_rx,
+            event_rx,
+            None,
+        );
+        view.request_initial_focus = false;
+        let background = TermBackground {
+            color: BG,
+            image: None,
+            image_mode: crate::config::TerminalImageMode::Stretch,
+            image_darkness: 0,
+        };
+
+        let name_id = egui::Id::new("rename-dialog-name");
+        let mut name = String::from("old.txt");
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.add(egui::TextEdit::singleline(&mut name).id(name_id))
+                .request_focus();
+            view.show(ui, &background, 13.0, false);
+        });
+        assert_eq!(ctx.memory(|memory| memory.focused()), Some(name_id));
+
+        let mut confirm_input = egui::RawInput::default();
+        confirm_input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run_ui(confirm_input, |ui| {
+            ui.add(egui::TextEdit::singleline(&mut name).id(name_id));
+            view.show(ui, &background, 13.0, false);
+        });
+
+        let mut shell_inputs = Vec::new();
+        while let Ok(command) = cmd_rx.try_recv() {
+            if let SessionCmd::Input(bytes) = command {
+                shell_inputs.push(bytes);
+            }
+        }
+        assert!(
+            shell_inputs.is_empty(),
+            "确认弹窗的回车不应同时写进 shell: {shell_inputs:?}"
+        );
     }
 
     #[test]
@@ -1516,8 +1755,11 @@ mod tests {
         assert_ne!(ctx.memory(|memory| memory.focused()), Some(other_id));
     }
 
+    /// 回归：epaint 会在字体图集将满、主题(字体颜色转换函数)变化或重新安装
+    /// 字体时整体重建图集。旧 Galley 里的字形 UV 随之失效，跨帧复用会让终端
+    /// 整屏文字变成随机字符(花屏)，因此每帧都必须用当前图集重新排版。
     #[test]
-    fn cursor_blink_reuses_cached_terminal_galleys() {
+    fn terminal_text_layout_follows_font_atlas_rebuild() {
         let ctx = egui::Context::default();
         let (cmd_tx, _cmd_rx) = session::cmd_channel();
         let (_data_tx, data_rx) = session::data_channel(ctx.clone());
@@ -1530,7 +1772,7 @@ mod tests {
             event_rx,
             None,
         );
-        view.feed_str("cached terminal text");
+        view.feed_str("font atlas rebuild");
 
         let mut first_galley = None;
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -1542,7 +1784,21 @@ mod tests {
                 BG,
                 true,
             );
-            first_galley = view.cached_text_runs.first().map(|run| run.galley.clone());
+            first_galley = view.text_runs.first().map(|run| run.galley.clone());
+        });
+        let first = first_galley.expect("terminal text should be laid out");
+
+        // 模拟字体定义变化(设置页切换字体/主题)导致的字体图集重建：旧 Galley
+        // 的字形 UV 已失效，必须用新图集重新排版。
+        let mut definitions = ctx.fonts(|fonts| fonts.definitions().clone());
+        definitions
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .push("Hack".to_owned());
+        ctx.set_fonts(definitions);
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             view.render_grid(
                 ui.painter(),
                 Rect::from_min_size(Pos2::ZERO, vec2(640.0, 384.0)),
@@ -1552,8 +1808,67 @@ mod tests {
                 false,
             );
         });
-        let first = first_galley.expect("terminal text should create a cached galley");
-        let second = &view.cached_text_runs[0].galley;
-        assert!(Arc::ptr_eq(&first, second));
+        let second = &view
+            .text_runs
+            .first()
+            .expect("terminal text should be laid out again")
+            .galley;
+        assert!(
+            !Arc::ptr_eq(&first, second),
+            "字体图集重建后必须重新排版，不能复用旧图集里的 Galley"
+        );
+        assert_eq!(first.text(), second.text());
+    }
+
+    /// lspci 等程序用 Tab 缩进子项，grep 再用 ANSI 切换匹配文字颜色。
+    /// Tab 已由终端网格展开，不能再进入字体 shaping，否则后续颜色 run 会
+    /// 按网格列绘制到被重复展开的 Tab 上方，形成文字重叠。
+    #[test]
+    fn tab_before_ansi_color_run_is_not_shaped_twice() {
+        let ctx = egui::Context::default();
+        crate::install_app_fonts(&ctx, "Hack");
+        let (cmd_tx, _cmd_rx) = session::cmd_channel();
+        let (_data_tx, data_rx) = session::data_channel(ctx.clone());
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut view = TermView::with_channels(
+            &ctx,
+            TermDims { cols: 80, rows: 24 },
+            cmd_tx,
+            data_rx,
+            event_rx,
+            None,
+        );
+        view.feed_str("\tSubsystem: \x1b[31mNVIDIA\x1b[0m Corporation");
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            view.render_grid(
+                ui.painter(),
+                Rect::from_min_size(Pos2::ZERO, vec2(640.0, 384.0)),
+                &crate::terminal_font_id(13.0),
+                vec2(8.0, 16.0),
+                BG,
+                false,
+            );
+        });
+
+        assert!(
+            view.text_runs
+                .iter()
+                .all(|run| !run.galley.text().contains('\t')),
+            "网格中残留的 Tab 不应再次进入文本布局"
+        );
+        let subsystem = view
+            .text_runs
+            .iter()
+            .find(|run| run.galley.text().contains("Subsystem"))
+            .expect("plain lspci run");
+        let nvidia = view
+            .text_runs
+            .iter()
+            .find(|run| run.galley.text() == "NVIDIA")
+            .expect("colored grep run");
+        assert_eq!(subsystem.start_col, 8);
+        assert_eq!(subsystem.end_col, nvidia.start_col);
+        assert_eq!(subsystem.galley.text(), "Subsystem: ");
     }
 }

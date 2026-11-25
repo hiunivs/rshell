@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 全应用离屏渲染:验证底部文件面板高度是否随文件数量变化。
 //! 运行:cargo test render_app -- --ignored --nocapture
 
@@ -18,6 +22,7 @@ mod tests {
             owner: "root".into(),
             group: "root".into(),
             is_symlink: false,
+            is_broken_symlink: false,
         }
     }
 
@@ -108,6 +113,103 @@ mod tests {
 
         assert!(harness.get_by_label("版本与更新").rect().is_positive());
         assert!(harness.get_by_label("检查更新").rect().is_positive());
+    }
+
+    #[test]
+    fn about_page_exposes_required_legal_notice() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| {
+            RShellApp::new_with_config(cc, crate::config::AppConfig::default())
+        });
+        harness.set_size(egui::vec2(1280.0, 800.0));
+        {
+            let app = harness.state_mut();
+            app.show_settings = true;
+            app.settings_sub = Some(crate::ui::settings::SettingsPage::About);
+        }
+        harness.run_steps(3);
+
+        assert!(harness.get_by_label("Based on RShell").rect().is_positive());
+        assert!(
+            harness
+                .get_by_label("Copyright (C) 2026 hiunivs")
+                .rect()
+                .is_positive()
+        );
+        assert!(
+            harness
+                .get_by_label("https://github.com/hiunivs/rshell")
+                .rect()
+                .is_positive()
+        );
+        assert!(
+            harness
+                .get_by_label("查看许可证与传播条件")
+                .rect()
+                .is_positive()
+        );
+    }
+
+    #[test]
+    fn reopening_tool_viewports_requests_focus_without_closing_them() {
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| RShellApp::new(cc));
+        let app = harness.state_mut();
+
+        app.open_settings_viewport();
+        assert!(app.show_settings);
+        assert!(app.focus_settings_viewport);
+        app.focus_settings_viewport = false;
+        app.open_settings_viewport();
+        assert!(app.show_settings);
+        assert!(app.focus_settings_viewport);
+
+        app.open_connection_library_viewport();
+        assert!(app.show_library);
+        assert!(app.focus_library_viewport);
+        app.focus_library_viewport = false;
+        app.open_connection_library_viewport();
+        assert!(app.show_library);
+        assert!(app.focus_library_viewport);
+    }
+
+    #[test]
+    fn collapsing_file_panel_expands_terminal_without_resizing_viewport() {
+        let mut harness = egui_kittest::Harness::new_eframe(|cc| RShellApp::new(cc));
+        harness.set_size(egui::vec2(1280.0, 800.0));
+        let ctx = harness.ctx.clone();
+        harness.state_mut().open_local(&ctx);
+        harness.run_steps(2);
+        std::thread::sleep(std::time::Duration::from_millis(170));
+        harness.step();
+        let viewport_size = harness.ctx.content_rect().size();
+
+        let expanded_panel_rows = harness.state().sessions[0]
+            .term
+            .as_ref()
+            .unwrap()
+            .dims()
+            .rows;
+        harness.state_mut().file_manager_visible = false;
+        harness.step();
+        std::thread::sleep(std::time::Duration::from_millis(170));
+        harness.step();
+        let collapsed_panel_rows = harness.state().sessions[0]
+            .term
+            .as_ref()
+            .unwrap()
+            .dims()
+            .rows;
+
+        assert!(
+            collapsed_panel_rows > expanded_panel_rows,
+            "隐藏文件窗后终端行数应增加: before={expanded_panel_rows}, after={collapsed_panel_rows}"
+        );
+        assert_eq!(
+            harness.ctx.content_rect().size(),
+            viewport_size,
+            "收起文件窗不应修改主窗口尺寸"
+        );
     }
 
     /// 渲染多连接标签栏:验证自绘标签块(× 在左,选中高亮,块间间隙)

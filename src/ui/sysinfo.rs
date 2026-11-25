@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 系统信息详细页(SysInfo 标签页内容,布局参考 FinalShell):
 //! 基本信息 → CPU → CPU 占用分类 → 内存/交换 → 网络接口表 → 文件系统表
 
@@ -11,10 +15,10 @@ const LABEL_W: f32 = 80.0;
 
 impl RShellApp {
     pub(crate) fn show_sysinfo_page(&mut self, ui: &mut egui::Ui) {
-        // 白底黑字:中央面板是终端深蓝底,深色主题文字在上面发灰看不清
+        // 跟随应用主题：深色模式用面板底色/浅色文字，浅色模式用浅底/深色文字。
+        // 不能写死白底黑字，否则深色主题下整页仍是白的。
         let rect = ui.available_rect_before_wrap();
-        ui.painter().rect_filled(rect, 0.0, egui::Color32::WHITE);
-        ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(0x1A, 0x1A, 0x1A));
+        ui.painter().rect_filled(rect, 0.0, ui.visuals().panel_fill);
 
         // SysInfo 标签:数据来自源会话的监控快照
         let Some(session) = self.effective_session() else {
@@ -27,14 +31,19 @@ impl RShellApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(10.0);
-                match metrics.as_deref() {
-                    Some(m) => sysinfo_detail(ui, m),
-                    None => {
-                        ui.add_space(20.0);
-                        ui.label(RichText::new("等待监控数据…").weak());
-                    }
-                }
+                // 页面左右留白：卡片不要贴着面板/滚动区边框，看起来才像独立卡片。
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(16, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        match metrics.as_deref() {
+                            Some(m) => sysinfo_detail(ui, m),
+                            None => {
+                                ui.add_space(20.0);
+                                ui.label(RichText::new("等待监控数据…").weak());
+                            }
+                        }
+                    });
             });
     }
 }
@@ -131,7 +140,7 @@ fn sysinfo_detail(ui: &mut egui::Ui, m: &SystemMetrics) {
             ui.painter().vline(
                 divider_x,
                 divider_top..=divider_bottom,
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(218, 222, 228)),
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
             );
         } else {
             memory_block(ui, "物理内存", m.mem_total_kb, m.mem_used_kb);
@@ -162,29 +171,29 @@ fn sysinfo_detail(ui: &mut egui::Ui, m: &SystemMetrics) {
             }
         });
     });
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(6.0);
+    ui.add_space(10.0);
 
     // ---- 文件系统(全部,含 tmpfs 等虚拟文件系统) ----
-    section_row(ui, "文件系统", |ui| {
-        table_header(ui, &["名称", "大小", "已用", "", "可用", "挂载点"]);
-        for d in &m.disks {
-            table_row(
-                ui,
-                &[
-                    d.fs.clone(),
-                    fmt_kb(d.total_kb),
-                    fmt_kb(d.used_kb),
-                    format!("{:.1}%", d.usage_frac() * 100.0),
-                    fmt_kb(d.avail_kb),
-                    d.path.clone(),
-                ],
-            );
-        }
-        if m.disks.is_empty() {
-            table_row(ui, &["—", "", "", "", "", ""]);
-        }
+    detail_section(ui, |ui| {
+        section_row(ui, "文件系统", |ui| {
+            table_header(ui, &["名称", "大小", "已用", "", "可用", "挂载点"]);
+            for d in &m.disks {
+                table_row(
+                    ui,
+                    &[
+                        d.fs.clone(),
+                        fmt_kb(d.total_kb),
+                        fmt_kb(d.used_kb),
+                        format!("{:.1}%", d.usage_frac() * 100.0),
+                        fmt_kb(d.avail_kb),
+                        d.path.clone(),
+                    ],
+                );
+            }
+            if m.disks.is_empty() {
+                table_row(ui, &["—", "", "", "", "", ""]);
+            }
+        });
     });
     ui.add_space(10.0);
 }
@@ -200,13 +209,13 @@ fn section_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui)) 
 /// 带边框的独立信息区块，用于清晰区分不同类别。
 fn detail_section(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(250, 251, 253))
+        .fill(ui.visuals().faint_bg_color)
         .stroke(egui::Stroke::new(
             1.0,
-            egui::Color32::from_rgb(218, 222, 228),
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
         ))
         .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(10, 8))
+        .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);

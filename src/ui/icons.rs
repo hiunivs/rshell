@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! RShell 的统一 Lucide SVG 图标。
 //!
 //! SVG 字节编译进程序；egui 的加载器会按稳定 URI 缓存解析和纹理结果，
@@ -10,11 +14,13 @@ pub(crate) enum Icon {
     BookOpen,
     ChevronDown,
     ChevronRight,
+    ChevronUp,
     Copy,
     Download,
     File,
     Folder,
     KeyRound,
+    Link,
     Pause,
     Pencil,
     Play,
@@ -43,6 +49,10 @@ impl Icon {
                 "bytes://rshell-icons/lucide/chevron-right.svg",
                 include_bytes!("../../assets/icons/lucide/chevron-right.svg"),
             ),
+            Self::ChevronUp => (
+                "bytes://rshell-icons/lucide/chevron-up.svg",
+                include_bytes!("../../assets/icons/lucide/chevron-up.svg"),
+            ),
             Self::Copy => (
                 "bytes://rshell-icons/lucide/copy.svg",
                 include_bytes!("../../assets/icons/lucide/copy.svg"),
@@ -62,6 +72,10 @@ impl Icon {
             Self::KeyRound => (
                 "bytes://rshell-icons/lucide/key-round.svg",
                 include_bytes!("../../assets/icons/lucide/key-round.svg"),
+            ),
+            Self::Link => (
+                "bytes://rshell-icons/lucide/link.svg",
+                include_bytes!("../../assets/icons/lucide/link.svg"),
             ),
             Self::Pause => (
                 "bytes://rshell-icons/lucide/pause.svg",

@@ -1,13 +1,18 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 use crate::app::{RShellApp, SessionKind};
 use crate::config::SavedConnection;
 use crate::session::ssh::{SshAuth, SshParams};
+use zeroize::Zeroize as _;
 
 /// 由表单字段构建连接参数(新建对话框与设置窗口共用)
 fn build_params(
     host: &str,
     port: &str,
     user: &str,
-    pass: &str,
+    pass: crate::secrets::SecretString,
     key: &str,
 ) -> Result<SshParams, String> {
     let host = host.trim();
@@ -34,14 +39,10 @@ fn build_params(
             .unwrap_or_else(|| key_path.to_string());
         SshAuth::KeyFile {
             path,
-            passphrase: if pass.is_empty() {
-                None
-            } else {
-                Some(pass.to_string())
-            },
+            passphrase: if pass.is_empty() { None } else { Some(pass) },
         }
     } else {
-        SshAuth::Password(pass.to_string())
+        SshAuth::Password(pass)
     };
     Ok(SshParams {
         host: host.to_string(),
@@ -68,7 +69,7 @@ pub(crate) fn params_from_saved(
             .unwrap_or_default();
         (c.key_path.clone(), pw)
     };
-    build_params(&c.host, &c.port.to_string(), &c.user, &pass, &key_path)
+    build_params(&c.host, &c.port.to_string(), &c.user, pass, &key_path)
 }
 
 impl RShellApp {
@@ -129,15 +130,23 @@ impl RShellApp {
             };
         }
 
+        self.edit_pass.zeroize();
         match &params.auth {
             SshAuth::Password(password) => {
                 let saved = crate::secrets::get(&account);
                 self.edit_remember = saved.is_some();
-                self.edit_pass = saved.unwrap_or_else(|| password.clone());
+                self.edit_pass = saved
+                    .as_ref()
+                    .map(crate::secrets::SecretString::expose)
+                    .unwrap_or_else(|| password.expose())
+                    .to_owned();
             }
             SshAuth::KeyFile { passphrase, .. } => {
                 // 自定义私钥的当前会话口令继续保留，用于“保存并重连”。
-                self.edit_pass = passphrase.clone().unwrap_or_default();
+                self.edit_pass = passphrase
+                    .as_ref()
+                    .map(|value| value.expose().to_owned())
+                    .unwrap_or_default();
                 self.edit_remember = false;
             }
         };
@@ -154,6 +163,7 @@ impl RShellApp {
         // 始终绑定打开窗口时的会话；切换标签不会改变编辑目标。
         let Some(edit_session_id) = self.edit_session_id else {
             self.show_session_edit = false;
+            self.edit_pass.zeroize();
             return;
         };
         let Some(session) = self
@@ -163,11 +173,13 @@ impl RShellApp {
         else {
             self.show_session_edit = false;
             self.edit_session_id = None;
+            self.edit_pass.zeroize();
             return;
         };
         if session.kind != SessionKind::Ssh {
             self.show_session_edit = false;
             self.edit_session_id = None;
+            self.edit_pass.zeroize();
             return;
         }
         let ctx = ui.ctx().clone();
@@ -307,6 +319,7 @@ impl RShellApp {
         self.show_session_edit = open && self.show_session_edit;
         if !self.show_session_edit {
             self.edit_session_id = None;
+            self.edit_pass.zeroize();
         }
     }
 
@@ -339,13 +352,15 @@ impl RShellApp {
             _ => None,
         };
         let (key_id, key_path, auth_password) = match &self.edit_key_mode {
-            crate::ui::conn_library::LcKeyMode::Password => {
-                (None, String::new(), self.edit_pass.clone())
-            }
+            crate::ui::conn_library::LcKeyMode::Password => (
+                None,
+                String::new(),
+                crate::secrets::SecretString::from(self.edit_pass.clone()),
+            ),
             crate::ui::conn_library::LcKeyMode::Path => (
                 None,
                 self.edit_key_path.trim().to_string(),
-                self.edit_pass.clone(),
+                crate::secrets::SecretString::from(self.edit_pass.clone()),
             ),
             crate::ui::conn_library::LcKeyMode::Key(_) => {
                 let (key_id, path, passphrase) = managed_auth.expect("上方已验证管理密钥");
@@ -356,7 +371,7 @@ impl RShellApp {
             &self.edit_host,
             &self.edit_port,
             &self.edit_user,
-            &auth_password,
+            auth_password,
             &key_path,
         ) {
             Ok(p) => p,

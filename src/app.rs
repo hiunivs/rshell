@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -111,6 +115,8 @@ pub struct Session {
     pub fm: FileManager,
     /// 等待用户确认的主机指纹请求
     pub pending_hostkey: Option<crate::session::HostKeyPrompt>,
+    /// 等待用户回答的 SSH Keyboard-Interactive/2FA 请求。
+    pub pending_keyboard_interactive: Option<crate::session::KeyboardInteractivePrompt>,
     /// SSH 连接参数(重连用;本机会话为 None)
     ssh_params: Option<SshParams>,
 }
@@ -128,6 +134,7 @@ impl Session {
             monitor: MonitorView::default(),
             fm: FileManager::new_ssh(None),
             pending_hostkey: None,
+            pending_keyboard_interactive: None,
             ssh_params: None,
         }
     }
@@ -145,6 +152,7 @@ impl Session {
                 monitor: MonitorView::default(),
                 fm: FileManager::new(Some(sftp_tx)),
                 pending_hostkey: None,
+                pending_keyboard_interactive: None,
                 ssh_params: None,
             },
             Err(e) => Self {
@@ -157,6 +165,7 @@ impl Session {
                 monitor: MonitorView::default(),
                 fm: FileManager::new(None),
                 pending_hostkey: None,
+                pending_keyboard_interactive: None,
                 ssh_params: None,
             },
         }
@@ -177,6 +186,7 @@ impl Session {
             monitor: MonitorView::default(),
             fm: FileManager::new_ssh(Some(sftp_tx)),
             pending_hostkey: None,
+            pending_keyboard_interactive: None,
             ssh_params: Some(params),
         }
     }
@@ -193,6 +203,7 @@ impl Session {
             monitor: MonitorView::default(),
             fm: FileManager::new(None),
             pending_hostkey: None,
+            pending_keyboard_interactive: None,
             ssh_params: None,
         }
     }
@@ -245,6 +256,7 @@ impl Session {
         };
         self.monitor = MonitorView::default();
         self.pending_hostkey = None;
+        self.pending_keyboard_interactive = None;
         self.error = None;
     }
 
@@ -252,6 +264,7 @@ impl Session {
     /// 终端网格还在就只换通道(滚回内容保留);网格没了才新建
     pub fn reconnect(&mut self, ctx: &egui::Context) {
         self.pending_hostkey = None;
+        self.pending_keyboard_interactive = None;
         self.monitor = MonitorView::default();
         match self.kind {
             // 启动页没有连接，不需要重连。
@@ -348,6 +361,8 @@ pub struct RShellApp {
     pub active: usize,
     next_seq: usize,
     pub bottom_tab: BottomTab,
+    /// 底部文件/命令面板是否展开。隐藏时中央 SSH 终端占满剩余高度。
+    pub file_manager_visible: bool,
     pub cmd_input: String,
     // 已保存的连接
     pub config: AppConfig,
@@ -355,8 +370,14 @@ pub struct RShellApp {
     pub cmd_history: Vec<String>,
     pub cmd_hist_idx: Option<usize>,
     pub cmd_history_draft: Option<String>,
+    /// 上一帧窗口是否处于前台；重新激活时强制重建字体图集。
+    was_focused: bool,
+    /// 上一帧绘制时间；用于识别休眠造成的长时间停帧。
+    last_frame_at: Option<std::time::Instant>,
     // 新建常用命令
     pub command_new_open: bool,
+    /// 弹窗刚打开：下一帧聚焦名称框，避免按键落到下层终端。
+    pub command_new_focus: bool,
     pub command_new_name: String,
     pub command_new_value: String,
     pub command_new_error: Option<String>,
@@ -382,6 +403,8 @@ pub struct RShellApp {
     pub edit_error: Option<String>,
     /// 设置窗口是否显示
     pub show_settings: bool,
+    /// 用户显式打开设置时，在下一帧召回并聚焦独立设置窗口。
+    pub(crate) focus_settings_viewport: bool,
     /// 设置窗口当前选中的页面
     pub settings_sub: Option<crate::ui::settings::SettingsPage>,
     /// 设置保存/迁移错误
@@ -399,6 +422,8 @@ pub struct RShellApp {
     pub(crate) terminal_background_error: Option<String>,
     /// 连接库窗口
     pub show_library: bool,
+    /// 用户显式打开连接库时，在下一帧召回并聚焦独立连接库窗口。
+    pub(crate) focus_library_viewport: bool,
     /// 连接库选中的文件夹(None = 全部)
     pub lib_folder: Option<String>,
     /// 连接库中处于折叠状态的文件夹路径
@@ -446,19 +471,29 @@ pub struct RShellApp {
     pub lc_error: Option<String>,
     // ---- 连接库:文件夹新建/重命名/删除 ----
     pub folder_new_open: bool,
+    /// 新建文件夹弹窗刚打开：下一帧聚焦名称框。
+    pub folder_new_focus: bool,
     pub folder_new_name: String,
     pub folder_new_parent: String,
     pub folder_rename_from: Option<String>,
     pub folder_rename_to: String,
+    /// 连接库文件夹重命名弹窗刚打开：下一帧聚焦并全选名称框。
+    pub folder_rename_focus: bool,
     pub folder_delete_pending: Option<String>,
+    /// 删除文件夹确认窗已经显示过至少一帧，避免打开它的同一次回车立即确认。
+    pub folder_delete_armed: bool,
     // ---- 连接库:标签快编 / 移动到文件夹 ----
     pub tag_edit_name: Option<String>,
+    /// 标签编辑弹窗刚打开：下一帧聚焦输入框。
+    pub tag_edit_focus: bool,
     pub tag_edit_value: String,
     pub move_folder_name: Option<String>,
     /// 密钥管理窗口
     pub show_keys: bool,
     // ---- 密钥管理:生成/登记/编辑 ----
     pub key_form_open: bool,
+    /// 密钥表单刚打开：下一帧聚焦名称框。
+    pub key_form_focus: bool,
     pub key_form_mode: crate::ui::conn_library::KeyFormMode,
     pub key_form_name: String,
     pub key_form_path: String,
@@ -529,12 +564,16 @@ impl RShellApp {
             active: 0,
             next_seq: 2,
             bottom_tab: BottomTab::Files,
+            file_manager_visible: true,
             cmd_input: String::new(),
             config: loaded_config,
             cmd_history: Vec::new(),
             cmd_hist_idx: None,
             cmd_history_draft: None,
+            was_focused: true,
+            last_frame_at: None,
             command_new_open: false,
+            command_new_focus: false,
             command_new_name: String::new(),
             command_new_value: String::new(),
             command_new_error: None,
@@ -555,6 +594,7 @@ impl RShellApp {
             edit_remember: true,
             edit_error: None,
             show_settings: false,
+            focus_settings_viewport: false,
             settings_sub: None,
             settings_error: None,
             updater,
@@ -563,6 +603,7 @@ impl RShellApp {
             terminal_background_rx: None,
             terminal_background_error: None,
             show_library: false,
+            focus_library_viewport: false,
             lib_folder: None,
             lib_collapsed_folders: HashSet::new(),
             lib_conn: None,
@@ -595,16 +636,21 @@ impl RShellApp {
             lc_key_path: String::new(),
             lc_error: None,
             folder_new_open: false,
+            folder_new_focus: false,
             folder_new_name: String::new(),
             folder_new_parent: String::new(),
             folder_rename_from: None,
             folder_rename_to: String::new(),
+            folder_rename_focus: false,
             folder_delete_pending: None,
+            folder_delete_armed: false,
             tag_edit_name: None,
+            tag_edit_focus: false,
             tag_edit_value: String::new(),
             move_folder_name: None,
             show_keys: false,
             key_form_open: false,
+            key_form_focus: false,
             key_form_mode: crate::ui::conn_library::KeyFormMode::Generate,
             key_form_name: String::new(),
             key_form_path: String::new(),
@@ -755,8 +801,47 @@ impl RShellApp {
     }
 }
 
+impl RShellApp {
+    /// 长时间后台/休眠后恢复时，强制重建字体图集并整张上传。
+    ///
+    /// 某些平台在窗口不可见期间仍可能重建字体图集，而纹理增量没有上传；
+    /// 恢复后 CPU 侧字形 UV 与 GPU 纹理不一致，会造成整窗文字重影/花纹。
+    fn recover_render_state_after_background(&mut self, ctx: &egui::Context) {
+        use std::time::{Duration, Instant};
+        const LONG_BACKGROUND: Duration = Duration::from_secs(60);
+
+        let now = Instant::now();
+        let focused = ctx.input(|input| input.focused);
+        // 休眠/停帧时 last_frame_at 会断开很久；即使窗口一直保持前台，
+        // 也说明 GPU 内容可能已经失效。
+        let long_pause = self
+            .last_frame_at
+            .is_some_and(|last| now.saturating_duration_since(last) >= LONG_BACKGROUND);
+        let focus_gained = focused && !self.was_focused;
+        let focus_event = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::WindowFocused(true)))
+        });
+
+        if focused && (focus_gained || focus_event || long_pause) {
+            // 实测重建一次字体图集约 2ms，代价很小；每次回到前台都做一次，
+            // 可覆盖“后台期间主题变化/图集重建但纹理增量丢失”的情况。
+            crate::force_font_texture_reupload(ctx);
+        }
+        if focus_gained || focus_event {
+            ctx.request_repaint();
+        }
+        self.was_focused = focused;
+        self.last_frame_at = Some(now);
+    }
+}
+
 impl eframe::App for RShellApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.recover_render_state_after_background(ui.ctx());
+
         // 记录用户调整后的主窗口内容尺寸；退出时统一写入配置。
         if let Some(rect) = ui.ctx().input(|input| input.viewport().inner_rect) {
             let size = rect.size();
@@ -794,9 +879,15 @@ impl eframe::App for RShellApp {
                 for p in term.take_hostkey() {
                     session.pending_hostkey = Some(p);
                 }
+                for prompt in term.take_keyboard_interactive() {
+                    session.pending_keyboard_interactive = Some(prompt);
+                }
             }
             session.fm.tick();
         }
+        // 编辑器是独立窗口，即使主窗口当前显示启动页/系统信息、没有绘制文件
+        // 面板，也必须持续处理所有会话的读取和保存完成事件。
+        self.drain_file_requests();
         // 2. 本机指标由后台线程采样，UI 线程只消费最新快照。
         let has_local = monitored_idx.is_some_and(|idx| {
             self.sessions
@@ -823,7 +914,11 @@ impl eframe::App for RShellApp {
             .get(self.active)
             .is_some_and(|session| matches!(session.kind, SessionKind::SysInfo(_)));
         let active_is_launcher = self.active_is_launcher();
-        if !no_file_manager_debug() && !active_is_sysinfo && !active_is_launcher {
+        if self.file_manager_visible
+            && !no_file_manager_debug()
+            && !active_is_sysinfo
+            && !active_is_launcher
+        {
             self.show_file_manager(ui);
         }
         if !no_terminal_debug() {
@@ -831,6 +926,7 @@ impl eframe::App for RShellApp {
         }
         self.show_session_edit_dialog(ui);
         self.show_hostkey_dialog(ui);
+        self.show_keyboard_interactive_dialog(ui);
         self.show_settings_dialog(ui);
         self.show_conn_library(ui);
         self.show_editor_viewport(ui);
@@ -951,7 +1047,7 @@ mod tests {
             host: host.into(),
             port: 22,
             user: user.into(),
-            auth: crate::session::ssh::SshAuth::Password(String::new()),
+            auth: crate::session::ssh::SshAuth::Password(String::new().into()),
         };
         let mut s = Session::ssh(&ctx, 3, params("a.com", "root"));
         assert_eq!(s.title, "root@a.com");

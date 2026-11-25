@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 远程文件类型判定:不下载整个文件,逐级推断 文本/可执行/二进制。
 //! 层级 1:unix 执行位(来自目录列表的 permissions,零请求);
 //! 层级 2:文件名/扩展名(零请求);
@@ -289,6 +293,7 @@ mod tests {
             owner: String::new(),
             group: String::new(),
             is_symlink: false,
+            is_broken_symlink: false,
         }
     }
 

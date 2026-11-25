@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 hiunivs
+# SPDX-License-Identifier: AGPL-3.0-only
+# Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][ValidateSet("x64", "arm64")][string]$Architecture,
@@ -16,6 +20,7 @@ $CargoToml = Get-Content (Join-Path $RootDir "Cargo.toml") -Raw
 $Match = [regex]::Match($CargoToml, '(?m)^version\s*=\s*"(?<version>\d+\.\d+\.\d+)"')
 if (-not $Match.Success) { throw "Cargo package version was not found" }
 $SemVer = $Match.Groups["version"].Value
+$ExpectedTag = "v$SemVer"
 $Parts = $SemVer.Split(".")
 foreach ($Part in $Parts) {
     if ([int]$Part -gt 65535) { throw "Each Windows package version component must be <= 65535" }
@@ -37,6 +42,32 @@ function Assert-NativeSuccess([string]$Step) {
     if ($LASTEXITCODE -ne 0) {
         throw "$Step failed with exit code $LASTEXITCODE"
     }
+}
+
+$RequiredLegalFiles = @(
+    "LICENSE",
+    "NOTICE",
+    "COMMERCIAL-LICENSE.md",
+    "THIRD_PARTY_NOTICES.md",
+    "THIRD_PARTY_LICENSES.html"
+)
+foreach ($LegalFile in $RequiredLegalFiles) {
+    if (-not (Test-Path -PathType Leaf (Join-Path $RootDir $LegalFile))) {
+        throw "Required legal file not found: $LegalFile"
+    }
+}
+
+$GitStatus = (& git -C $RootDir status --porcelain --untracked-files=normal) -join ""
+Assert-NativeSuccess "Checking Git worktree"
+if ($GitStatus) { throw "Release builds require a clean Git worktree" }
+$HeadCommit = (& git -C $RootDir rev-parse HEAD).Trim()
+Assert-NativeSuccess "Reading release commit"
+& git -C $RootDir show-ref --verify --quiet "refs/tags/$ExpectedTag"
+if ($LASTEXITCODE -ne 0) { throw "Release tag not found: $ExpectedTag" }
+$TagCommit = (& git -C $RootDir rev-parse "$ExpectedTag^{commit}").Trim()
+Assert-NativeSuccess "Reading release tag"
+if ($TagCommit -ne $HeadCommit) {
+    throw "Release commit must be tagged exactly $ExpectedTag"
 }
 
 $StableBaseUrl = Get-SecureBaseUrl "UpdateBaseUrl" $UpdateBaseUrl
@@ -64,13 +95,22 @@ cargo build --locked --release --target $Target --manifest-path (Join-Path $Root
 Assert-NativeSuccess "Building RShell"
 
 $DistDir = Join-Path $RootDir "dist/windows/$ReleaseChannel"
+$SourceDistDir = Join-Path $RootDir "dist/source"
 $StageDir = Join-Path $env:TEMP ("rshell-msix-" + [Guid]::NewGuid().ToString("N"))
 $PackageDir = Join-Path $StageDir "package"
 $BundleInputDir = Join-Path $StageDir "bundle"
-New-Item -ItemType Directory -Force $PackageDir, (Join-Path $PackageDir "Assets"), $BundleInputDir, $DistDir | Out-Null
+$LicensesDir = Join-Path $PackageDir "Licenses"
+New-Item -ItemType Directory -Force $PackageDir, (Join-Path $PackageDir "Assets"), $LicensesDir, $BundleInputDir, $DistDir, $SourceDistDir | Out-Null
 
 try {
     Copy-Item (Join-Path $RootDir "target/$Target/release/rshell.exe") (Join-Path $PackageDir "rshell.exe")
+    Copy-Item (Join-Path $RootDir "LICENSE") (Join-Path $LicensesDir "RShell-AGPL-3.0-only.txt")
+    Copy-Item (Join-Path $RootDir "NOTICE") (Join-Path $LicensesDir "RShell-NOTICE.txt")
+    Copy-Item (Join-Path $RootDir "COMMERCIAL-LICENSE.md") (Join-Path $LicensesDir "RShell-COMMERCIAL-LICENSING.md")
+    Copy-Item (Join-Path $RootDir "THIRD_PARTY_NOTICES.md") (Join-Path $LicensesDir "THIRD_PARTY_NOTICES.md")
+    Copy-Item (Join-Path $RootDir "THIRD_PARTY_LICENSES.html") (Join-Path $LicensesDir "THIRD_PARTY_LICENSES.html")
+    Copy-Item (Join-Path $RootDir "assets/fonts/OFL.txt") (Join-Path $LicensesDir "Noto-Sans-SC-OFL-1.1.txt")
+    Copy-Item (Join-Path $RootDir "assets/icons/lucide/LICENSE") (Join-Path $LicensesDir "Lucide-ISC.txt")
     $Manifest = Get-Content (Join-Path $PSScriptRoot "AppxManifest.xml") -Raw
     $Manifest = $Manifest.Replace("__PACKAGE_NAME__", [Security.SecurityElement]::Escape($PackageName))
     $Manifest = $Manifest.Replace("__PUBLISHER__", [Security.SecurityElement]::Escape($Publisher))
@@ -151,8 +191,30 @@ try {
     $AppInstaller = $AppInstaller.Replace("__BUNDLE_URL__", [Security.SecurityElement]::Escape($BundleUrl))
     Set-Content (Join-Path $DistDir "RShell.appinstaller") $AppInstaller -Encoding utf8
 
+    # Ship the exact tagged source together with all locked Cargo dependency
+    # sources needed to rebuild it.
+    $SourceRoot = Join-Path $StageDir "RShell-$SemVer"
+    $SourceTar = Join-Path $StageDir "rshell-source.tar"
+    New-Item -ItemType Directory -Force $SourceRoot, (Join-Path $SourceRoot ".cargo") | Out-Null
+    & git -C $RootDir archive --format=tar --output=$SourceTar $ExpectedTag
+    Assert-NativeSuccess "Exporting tagged source"
+    & tar -xf $SourceTar -C $SourceRoot
+    Assert-NativeSuccess "Extracting tagged source"
+    Push-Location $SourceRoot
+    try {
+        $VendorConfig = & cargo vendor --locked --versioned-dirs vendor
+        Assert-NativeSuccess "Vendoring locked dependency sources"
+        $VendorConfig | Set-Content (Join-Path $SourceRoot ".cargo/config.toml") -Encoding utf8
+    } finally {
+        Pop-Location
+    }
+    $SourceArchive = Join-Path $SourceDistDir "RShell-$SemVer-source.zip"
+    & tar -a -cf $SourceArchive -C $StageDir "RShell-$SemVer"
+    Assert-NativeSuccess "Creating corresponding source archive"
+
     Write-Host "Created $BundlePath"
     Write-Host "Created $(Join-Path $DistDir 'RShell.appinstaller')"
+    Write-Host "Created $SourceArchive"
 } finally {
     if (Test-Path $StageDir) { Remove-Item -Recurse -Force $StageDir }
 }

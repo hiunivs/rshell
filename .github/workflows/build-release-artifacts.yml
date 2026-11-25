@@ -56,8 +56,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  licenses:
+    name: Verify release source and licenses
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Require the version tag at HEAD
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          EXPECTED_TAG="v$VERSION"
+          [[ "$(git rev-parse HEAD)" == "$(git rev-parse "refs/tags/$EXPECTED_TAG^{commit}")" ]]
+      - name: Install pinned license-report generator
+        shell: bash
+        run: cargo install --locked --version 0.9.1 --features cli cargo-about
+      - name: Verify locked dependency licenses and committed report
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo about generate --locked --fail \
+            --config about.toml \
+            --output-file THIRD_PARTY_LICENSES.html \
+            about.hbs
+          git diff --exit-code -- THIRD_PARTY_LICENSES.html
+
   macos:
     name: macOS universal (signed and notarized)
+    needs: licenses
     runs-on: macos-15
     environment: release
     env:
@@ -74,6 +103,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Install pinned Rust targets
         shell: bash
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -103,7 +133,9 @@ jobs:
           tar -xJf "$RUNNER_TEMP/Sparkle.tar.xz" -C "$RUNNER_TEMP/Sparkle"
           test -d "$RUNNER_TEMP/Sparkle/Sparkle.framework"
           test -x "$RUNNER_TEMP/Sparkle/bin/generate_appcast"
+          test -f "$RUNNER_TEMP/Sparkle/LICENSE"
           echo "SPARKLE_FRAMEWORK_PATH=$RUNNER_TEMP/Sparkle/Sparkle.framework" >> "$GITHUB_ENV"
+          echo "SPARKLE_LICENSE_PATH=$RUNNER_TEMP/Sparkle/LICENSE" >> "$GITHUB_ENV"
           echo "SPARKLE_BIN_DIR=$RUNNER_TEMP/Sparkle/bin" >> "$GITHUB_ENV"
 
       - name: Import release credentials into temporary keychain
@@ -166,6 +198,7 @@ jobs:
           name: rshell-macos-${{ inputs.macos_release_channel }}-${{ inputs.build_number }}
           path: |
             dist/macos/RShell-*.zip
+            dist/source/RShell-*-source.tar.gz
             dist/macos/appcast.xml
             dist/macos/*.delta
           if-no-files-found: error
@@ -182,12 +215,14 @@ jobs:
 
   windows:
     name: Windows x64 (signed MSIX)
+    needs: licenses
     runs-on: windows-2025
     environment: release
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Install pinned Rust target
         shell: pwsh
         run: rustup target add x86_64-pc-windows-msvc
@@ -230,6 +265,8 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rshell-windows-${{ inputs.windows_release_channel }}-${{ inputs.build_number }}
-          path: dist/windows/${{ inputs.windows_release_channel }}/*
+          path: |
+            dist/windows/${{ inputs.windows_release_channel }}/*
+            dist/source/RShell-*-source.zip
           if-no-files-found: error
           retention-days: 14

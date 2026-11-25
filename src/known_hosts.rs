@@ -1,8 +1,13 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 已知主机指纹库(TOFU):使用平台标准 App 配置目录。
 //! 格式为 host:port → 指纹/算法/公钥文本,首次连接时由用户确认后写入。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -22,6 +27,10 @@ pub struct KnownHosts {
     pub hosts: HashMap<String, KnownHostKey>,
     #[serde(skip, default = "writable_default")]
     writable: bool,
+    /// 只记录本快照修改过的主机，保存时与磁盘最新快照合并，
+    /// 避免两个 SSH 会话同时首连不同主机时后写覆盖先写。
+    #[serde(skip, default)]
+    pending: HashMap<String, KnownHostKey>,
 }
 
 fn writable_default() -> bool {
@@ -33,6 +42,7 @@ impl Default for KnownHosts {
         Self {
             hosts: HashMap::new(),
             writable: true,
+            pending: HashMap::new(),
         }
     }
 }
@@ -104,11 +114,27 @@ impl KnownHosts {
         let Some(path) = default_path() else {
             anyhow::bail!("无法确定配置目录");
         };
+        self.save_to(&path)
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        static SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = SAVE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("已知主机保存锁已损坏"))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let text = toml::to_string_pretty(self)?;
-        crate::storage::atomic_write(&path, text.as_bytes(), true)?;
+        // 锁内重新读取，只合并本实例的 pending，不把它加载时的
+        // 旧快照重新覆盖到其他会话的新修改上。
+        let mut merged = Self::load_from(Some(path));
+        if !merged.writable {
+            anyhow::bail!("已知主机文件重新读取失败，已禁止覆盖");
+        }
+        merged.hosts.extend(self.pending.clone());
+        let text = toml::to_string_pretty(&merged)?;
+        crate::storage::atomic_write(path, text.as_bytes(), true)?;
         Ok(())
     }
 
@@ -124,7 +150,9 @@ impl KnownHosts {
     }
 
     pub fn record(&mut self, host: &str, port: u16, key: KnownHostKey) {
-        self.hosts.insert(host_key_id(host, port), key);
+        let id = host_key_id(host, port);
+        self.hosts.insert(id.clone(), key.clone());
+        self.pending.insert(id, key);
     }
 }
 
@@ -166,5 +194,31 @@ mod tests {
             parsed.check("example.com", 22, "SHA256:xyz"),
             HostKeyStatus::Match
         );
+    }
+
+    #[test]
+    fn concurrent_stale_snapshots_merge_only_their_own_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "rshell-known-hosts-{}-{}.toml",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut first = KnownHosts::load_from(Some(&path));
+        let mut second = KnownHosts::load_from(Some(&path));
+        first.record("first.example", 22, key("SHA256:first"));
+        second.record("second.example", 22, key("SHA256:second"));
+        first.save_to(&path).unwrap();
+        second.save_to(&path).unwrap();
+
+        let merged = KnownHosts::load_from(Some(&path));
+        assert_eq!(
+            merged.check("first.example", 22, "SHA256:first"),
+            HostKeyStatus::Match
+        );
+        assert_eq!(
+            merged.check("second.example", 22, "SHA256:second"),
+            HostKeyStatus::Match
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

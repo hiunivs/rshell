@@ -1,7 +1,100 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 文件管理共享模型:FileEntry、SFTP 命令/事件、路径与时间工具。
 //! 远程会话经 russh-sftp 实现,本机会话经 std::fs 实现,UI 统一消费。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 验证 SFTP `READDIR` 返回的名称只是一个文件名分量。
+///
+/// SFTP 服务器不在本地信任边界内；伪造的 `../../x`、绝对路径或
+/// Windows 分隔符不能被拼到本地下载目录。正常点文件（如 `.env`）允许。
+pub fn validate_sftp_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("空文件名".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("非法路径分量 {name:?}"));
+    }
+    if name.contains('\0') || name.contains('/') || name.contains('\\') {
+        return Err(format!("文件名包含路径分隔符: {name:?}"));
+    }
+    let mut components = std::path::Path::new(name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(format!("不是单一文件名分量: {name:?}"));
+    }
+    #[cfg(windows)]
+    if is_windows_unsafe_name(name) {
+        return Err(format!("Windows 不安全文件名: {name:?}"));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_unsafe_name(name: &str) -> bool {
+    if name.contains(':') || name.ends_with([' ', '.']) {
+        return true;
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
+}
+
+/// 编辑器写回文件时使用的权限级别。
+pub enum WritePrivilege {
+    Normal,
+    /// 远端 SSH 会话通过 sudo 执行受控的原子替换。None 表示只使用已有的
+    /// sudo 凭据缓存或免密规则，不进行交互式密码认证。
+    Elevated {
+        password: Option<zeroize::Zeroizing<String>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteFailureKind {
+    /// 当前登录用户不能在目标目录创建或替换文件，可以显式尝试管理员保存。
+    PermissionDenied,
+    /// 文件自打开/上次保存后已经被其他程序修改。
+    Conflict,
+    /// sudo 密码错误、需要密码但未提供，或 sudo 策略拒绝认证。
+    Authentication,
+    /// 写入前的安全校验没有通过（例如 sudoers 语法错误）。
+    Validation,
+    /// 当前会话或远端系统不支持所请求的安全保存方式。
+    Unsupported,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteFailure {
+    pub kind: WriteFailureKind,
+    pub message: String,
+}
+
+impl WriteFailure {
+    pub fn new(kind: WriteFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+pub type WriteResult = Result<(), WriteFailure>;
 
 type LocalTransferControls = std::sync::Arc<
     std::sync::Mutex<
@@ -14,16 +107,30 @@ pub(crate) struct TransferControl {
     canceled: AtomicBool,
     paused: AtomicBool,
     started: AtomicBool,
+    async_changed: tokio::sync::Notify,
+    blocking_lock: std::sync::Mutex<()>,
+    blocking_changed: std::sync::Condvar,
 }
 
 impl TransferControl {
     pub(crate) fn cancel(&self) {
+        // 与 Condvar 等待方使用同一把锁，保证状态修改与 notify 不会落在
+        // “检查 paused”和“真正睡眠”之间而丢失唤醒。
+        let blocking_guard = self.blocking_lock.lock().ok();
         self.canceled.store(true, Ordering::Release);
         self.paused.store(false, Ordering::Release);
+        self.blocking_changed.notify_all();
+        drop(blocking_guard);
+        self.async_changed.notify_waiters();
     }
 
     pub(crate) fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Release);
+        let blocking_guard = self.blocking_lock.lock().ok();
+        if self.paused.swap(paused, Ordering::AcqRel) != paused {
+            self.blocking_changed.notify_all();
+            drop(blocking_guard);
+            self.async_changed.notify_waiters();
+        }
     }
 
     fn mark_started(&self) {
@@ -35,36 +142,48 @@ impl TransferControl {
     }
 
     pub(crate) fn wait_blocking(&self) -> Result<(), String> {
-        while self.paused.load(Ordering::Acquire) {
+        let mut guard = self
+            .blocking_lock
+            .lock()
+            .map_err(|_| "传输控制锁已损坏".to_string())?;
+        loop {
             if self.canceled.load(Ordering::Acquire) {
                 return Err("传输已取消".into());
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        if self.canceled.load(Ordering::Acquire) {
-            Err("传输已取消".into())
-        } else {
-            Ok(())
+            if !self.paused.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            guard = self
+                .blocking_changed
+                .wait(guard)
+                .map_err(|_| "传输控制锁已损坏".to_string())?;
         }
     }
 
     pub(crate) async fn wait_async(&self) -> Result<(), String> {
-        while self.paused.load(Ordering::Acquire) {
+        loop {
+            let notified = self.async_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.canceled.load(Ordering::Acquire) {
                 return Err("传输已取消".into());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        if self.canceled.load(Ordering::Acquire) {
-            Err("传输已取消".into())
-        } else {
-            Ok(())
+            if !self.paused.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            notified.await;
         }
     }
 
     pub(crate) async fn wait_canceled(&self) {
-        while !self.canceled.load(Ordering::Acquire) {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        loop {
+            let notified = self.async_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.canceled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -85,6 +204,8 @@ pub struct FileEntry {
     pub group: String,
     /// 是符号链接(is_dir/size 等已按链接目标解析)
     pub is_symlink: bool,
+    /// 符号链接的目标无法解析(悬空链接/目标不可访问)
+    pub is_broken_symlink: bool,
 }
 
 impl FileEntry {
@@ -109,6 +230,8 @@ impl FileEntry {
 pub enum SftpCmd {
     List(String),
     Mkdir(String),
+    /// 新建空文件；目标已存在时失败，避免清空已有文件。
+    CreateFile(String),
     Remove {
         path: String,
         is_dir: bool,
@@ -163,11 +286,13 @@ pub enum SftpCmd {
         path: String,
         max_bytes: u64,
     },
-    /// 把内存中的内容整体写回文件(编辑器保存;远端先写临时文件再 rename)
+    /// 把内存中的内容安全写回文件。expected_sha256=None 只用于用户确认后的强制覆盖。
     WriteFile {
         id: u64,
         path: String,
         data: Vec<u8>,
+        expected_sha256: Option<[u8; 32]>,
+        privilege: WritePrivilege,
     },
     /// 用 `file --mime-type` 判定文件类型(层级 3;不支持的环境返回 Err)
     DetectKind {
@@ -208,6 +333,8 @@ pub enum SftpEvent {
         path: String,
         result: Result<Vec<u8>, String>,
     },
+    /// 编辑器保存结果单独建模，避免把权限、冲突和认证错误压成字符串。
+    FileWritten { id: u64, result: WriteResult },
     /// DetectKind 的结果(`file --mime-type -b` 的原始输出,已 trim)
     KindDetected {
         id: u64,
@@ -475,6 +602,16 @@ fn handle_local_cmd_with_ctx(
             op: "mkdir",
             result: std::fs::create_dir(&path).map_err(|e| e.to_string()),
         },
+        SftpCmd::CreateFile(path) => SftpEvent::OpDone {
+            id: None,
+            op: "create_file",
+            result: std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        },
         SftpCmd::Remove { path, is_dir } => SftpEvent::OpDone {
             id: None,
             op: "remove",
@@ -531,12 +668,26 @@ fn handle_local_cmd_with_ctx(
             let result = read_local_capped(&path, max_bytes);
             SftpEvent::FileContent { id, path, result }
         }
-        SftpCmd::WriteFile { id, path, data } => SftpEvent::OpDone {
-            id: Some(id),
-            op: "write",
-            result: crate::storage::atomic_write(std::path::Path::new(&path), &data, false)
-                .map_err(|e| format!("{e:#}")),
-        },
+        SftpCmd::WriteFile {
+            id,
+            path,
+            data,
+            expected_sha256,
+            privilege,
+        } => {
+            let result = match privilege {
+                WritePrivilege::Normal => {
+                    write_local_editor_atomic(id, &path, &data, expected_sha256)
+                }
+                WritePrivilege::Elevated {
+                    password: _password,
+                } => Err(WriteFailure::new(
+                    WriteFailureKind::Unsupported,
+                    "本机管理员保存尚未启用；请使用系统管理员编辑工具",
+                )),
+            };
+            SftpEvent::FileWritten { id, result }
+        }
         SftpCmd::DetectKind { id, path } => {
             let result = detect_kind_local(&path);
             SftpEvent::KindDetected { id, path, result }
@@ -556,6 +707,232 @@ fn read_local_capped(path: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
         .read_to_end(&mut out)
         .map_err(|e| format!("读取 {path} 失败: {e}"))?;
     Ok(out)
+}
+
+/// 本机编辑器保存也使用与远端相同的冲突检测和元数据保留规则。
+fn write_local_editor_atomic(
+    id: u64,
+    path: &str,
+    data: &[u8],
+    expected_sha256: Option<[u8; 32]>,
+) -> WriteResult {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Write as _;
+
+    let requested = std::path::Path::new(path);
+    let target = std::fs::canonicalize(requested).map_err(|error| {
+        local_write_failure(
+            WriteFailureKind::Other,
+            format!("无法解析目标文件 {path}"),
+            error,
+        )
+    })?;
+    verify_local_digest(&target, expected_sha256)?;
+    let original = std::fs::metadata(&target).map_err(|error| {
+        local_write_failure(
+            WriteFailureKind::Other,
+            format!("读取 {} 元数据失败", target.display()),
+            error,
+        )
+    })?;
+    if !original.is_file() {
+        return Err(WriteFailure::new(
+            WriteFailureKind::Unsupported,
+            format!("{} 不是普通文件，已拒绝替换", target.display()),
+        ));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| WriteFailure::new(WriteFailureKind::Unsupported, "目标文件没有父目录"))?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let mut temp = None;
+    let mut last_error = None;
+    for _ in 0..3 {
+        let mut nonce = [0u8; 8];
+        rand::fill(&mut nonce);
+        let candidate = parent.join(format!(
+            ".{name}.rshell-part-{id}-{:016x}",
+            u64::from_ne_bytes(nonce)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => {
+                temp = Some((candidate, file));
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let Some((temp_path, mut file)) = temp else {
+        return Err(local_write_failure(
+            WriteFailureKind::PermissionDenied,
+            format!("无法在 {} 创建安全临时文件", parent.display()),
+            last_error.expect("three local temp attempts"),
+        ));
+    };
+
+    let result = (|| -> WriteResult {
+        file.write_all(data).map_err(|error| {
+            local_write_failure(
+                WriteFailureKind::Other,
+                format!("写入 {} 失败", temp_path.display()),
+                error,
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            local_write_failure(
+                WriteFailureKind::Other,
+                format!("同步 {} 失败", temp_path.display()),
+                error,
+            )
+        })?;
+        preserve_local_metadata(&file, &original).map_err(|error| {
+            local_write_failure(
+                WriteFailureKind::PermissionDenied,
+                format!("无法保留 {} 的所有者或权限", target.display()),
+                error,
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            local_write_failure(
+                WriteFailureKind::Other,
+                format!("同步 {} 元数据失败", temp_path.display()),
+                error,
+            )
+        })?;
+        drop(file);
+        verify_local_digest(&target, expected_sha256)?;
+        std::fs::rename(&temp_path, &target).map_err(|error| {
+            local_write_failure(
+                WriteFailureKind::PermissionDenied,
+                format!("原子替换 {} 失败", target.display()),
+                error,
+            )
+        })?;
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        let actual: [u8; 32] = Sha256::digest(std::fs::read(&target).map_err(|error| {
+            local_write_failure(
+                WriteFailureKind::Other,
+                format!("保存后校验 {} 失败", target.display()),
+                error,
+            )
+        })?)
+        .into();
+        let wanted: [u8; 32] = Sha256::digest(data).into();
+        if actual != wanted {
+            return Err(WriteFailure::new(
+                WriteFailureKind::Other,
+                format!("{} 保存后的摘要校验失败，请立即检查文件", target.display()),
+            ));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn verify_local_digest(path: &std::path::Path, expected: Option<[u8; 32]>) -> WriteResult {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        local_write_failure(
+            WriteFailureKind::Other,
+            format!("保存前无法读取 {} 元数据", path.display()),
+            error,
+        )
+    })?;
+    if metadata.len() > 32 * 1024 * 1024 {
+        return Err(WriteFailure::new(
+            WriteFailureKind::Conflict,
+            format!("{} 已变为过大的文件，已拒绝覆盖", path.display()),
+        ));
+    }
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        local_write_failure(
+            WriteFailureKind::Other,
+            format!("保存前无法读取 {}", path.display()),
+            error,
+        )
+    })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            local_write_failure(
+                WriteFailureKind::Other,
+                format!("保存前校验 {} 失败", path.display()),
+                error,
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    if <[u8; 32]>::from(digest.finalize()) == expected {
+        Ok(())
+    } else {
+        Err(WriteFailure::new(
+            WriteFailureKind::Conflict,
+            format!("{} 自打开或上次保存后已被修改，未覆盖", path.display()),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn preserve_local_metadata(
+    file: &std::fs::File,
+    original: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let current = file.metadata()?;
+    if current.uid() != original.uid() || current.gid() != original.gid() {
+        let result = unsafe { libc::fchown(file.as_raw_fd(), original.uid(), original.gid()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(original.mode() & 0o7777))
+}
+
+#[cfg(not(unix))]
+fn preserve_local_metadata(
+    file: &std::fs::File,
+    original: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    file.set_permissions(original.permissions())
+}
+
+fn local_write_failure(
+    fallback: WriteFailureKind,
+    context: impl Into<String>,
+    error: std::io::Error,
+) -> WriteFailure {
+    let kind = if error.kind() == std::io::ErrorKind::PermissionDenied {
+        WriteFailureKind::PermissionDenied
+    } else {
+        fallback
+    };
+    WriteFailure::new(kind, format!("{}: {error}", context.into()))
 }
 
 /// 本机 `file --mime-type -b`;平台没有 file 命令时返回 Err(调用方回退)
@@ -776,7 +1153,10 @@ fn copy_dir_file(
 
 /// 递归删除:目录用 remove_dir_all,文件/链接用 remove_file
 fn remove_local_recursive(path: &str) -> Result<(), String> {
-    let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+    // 用 symlink_metadata：指向目录的链接也必须只删除链接本身。
+    let is_dir = std::fs::symlink_metadata(path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
     if is_dir {
         std::fs::remove_dir_all(path).map_err(|e| e.to_string())
     } else {
@@ -955,15 +1335,23 @@ fn list_local(path: &str) -> std::io::Result<Vec<FileEntry>> {
         let name = entry.file_name().to_string_lossy().into_owned();
         // DirEntry::metadata 不跟随符号链接,需用 fs::metadata 解析链接目标;
         // 链接目标不存在(悬空链接)时退化为链接自身的属性
-        let meta = std::fs::metadata(entry.path()).or_else(|_| entry.metadata())?;
         let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
-        out.push(local_entry(name, &meta, is_symlink));
+        let target_meta = std::fs::metadata(entry.path());
+        // 链接存在但目标 stat 失败：悬空链接或目标不可访问。
+        let is_broken_symlink = is_symlink && target_meta.is_err();
+        let meta = target_meta.or_else(|_| entry.metadata())?;
+        out.push(local_entry(name, &meta, is_symlink, is_broken_symlink));
     }
     Ok(out)
 }
 
 #[cfg(unix)]
-fn local_entry(name: String, meta: &std::fs::Metadata, is_symlink: bool) -> FileEntry {
+fn local_entry(
+    name: String,
+    meta: &std::fs::Metadata,
+    is_symlink: bool,
+    is_broken_symlink: bool,
+) -> FileEntry {
     use std::os::unix::fs::MetadataExt;
     FileEntry {
         name,
@@ -976,11 +1364,17 @@ fn local_entry(name: String, meta: &std::fs::Metadata, is_symlink: bool) -> File
         owner: String::new(),
         group: String::new(),
         is_symlink,
+        is_broken_symlink,
     }
 }
 
 #[cfg(not(unix))]
-fn local_entry(name: String, meta: &std::fs::Metadata, is_symlink: bool) -> FileEntry {
+fn local_entry(
+    name: String,
+    meta: &std::fs::Metadata,
+    is_symlink: bool,
+    is_broken_symlink: bool,
+) -> FileEntry {
     use std::time::UNIX_EPOCH;
     let mtime = meta
         .modified()
@@ -999,6 +1393,7 @@ fn local_entry(name: String, meta: &std::fs::Metadata, is_symlink: bool) -> File
         owner: String::new(),
         group: String::new(),
         is_symlink,
+        is_broken_symlink,
     }
 }
 
@@ -1009,6 +1404,71 @@ fn local_entry(name: String, meta: &std::fs::Metadata, is_symlink: bool) -> File
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paused_blocking_transfer_wakes_immediately_on_resume() {
+        let control = std::sync::Arc::new(TransferControl::default());
+        control.set_paused(true);
+        let waiter_control = std::sync::Arc::clone(&control);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done_tx.send(waiter_control.wait_blocking()).unwrap();
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err()
+        );
+        control.set_paused(false);
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn async_transfer_wait_is_released_by_cancel() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let control = std::sync::Arc::new(TransferControl::default());
+            control.set_paused(true);
+            let waiter_control = std::sync::Arc::clone(&control);
+            let waiter = tokio::spawn(async move { waiter_control.wait_async().await });
+            tokio::task::yield_now().await;
+            control.cancel();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error, "传输已取消");
+        });
+    }
+
+    #[test]
+    fn sftp_names_must_be_single_safe_components() {
+        for safe in ["file.txt", ".env", "中文 文件"] {
+            assert!(validate_sftp_name(safe).is_ok(), "rejected {safe:?}");
+        }
+        for unsafe_name in ["", ".", "..", "../escape", "a/b", "a\\b", "/tmp/x"] {
+            assert!(
+                validate_sftp_name(unsafe_name).is_err(),
+                "accepted {unsafe_name:?}"
+            );
+        }
+        assert!(is_windows_unsafe_name("C:escape"));
+        assert!(is_windows_unsafe_name("NUL.txt"));
+        assert!(is_windows_unsafe_name("COM1"));
+        assert!(is_windows_unsafe_name("name."));
+        assert!(!is_windows_unsafe_name(".env"));
+        assert!(!is_windows_unsafe_name("normal.txt"));
+    }
 
     #[test]
     fn read_local_capped_reads_prefix() {
@@ -1118,6 +1578,31 @@ mod tests {
             }
             _ => panic!("list failed: {:?}", std::mem::discriminant(&ev)),
         }
+
+        // 新建空文件；重复创建不能清空已有目标。
+        let empty = join_path(&sub, "empty.txt");
+        let ev = handle_local_cmd(SftpCmd::CreateFile(empty.clone()), &dummy_tx());
+        assert!(matches!(
+            ev,
+            SftpEvent::OpDone {
+                op: "create_file",
+                result: Ok(()),
+                ..
+            }
+        ));
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
+        std::fs::write(&empty, b"keep").unwrap();
+        let ev = handle_local_cmd(SftpCmd::CreateFile(empty.clone()), &dummy_tx());
+        assert!(matches!(
+            ev,
+            SftpEvent::OpDone {
+                op: "create_file",
+                result: Err(_),
+                ..
+            }
+        ));
+        assert_eq!(std::fs::read(&empty).unwrap(), b"keep");
+        std::fs::remove_file(&empty).unwrap();
 
         // rename
         let f2 = join_path(&sub, "b.txt");
@@ -1262,6 +1747,76 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// 悬空符号链接：目标不存在时仍要列出条目，并标记为失效链接。
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_flagged_broken() {
+        let dir = test_dir("dangling_link");
+        let link = dir.join("broken");
+        std::os::unix::fs::symlink(dir.join("missing"), &link).unwrap();
+        let event = handle_local_cmd(
+            SftpCmd::List(dir.to_string_lossy().into_owned()),
+            &dummy_tx(),
+        );
+        let SftpEvent::Listed {
+            result: Ok(entries),
+            ..
+        } = event
+        else {
+            panic!("list failed");
+        };
+        let broken = entries.iter().find(|e| e.name == "broken").unwrap();
+        assert!(broken.is_symlink, "悬空链接仍然是符号链接");
+        assert!(broken.is_broken_symlink, "目标不存在应标记为失效链接");
+        assert!(!broken.is_dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 删除指向目录的符号链接时只能 unlink 链接本身，不能递归进目标目录。
+    #[cfg(unix)]
+    #[test]
+    fn removing_symlinked_dir_does_not_touch_target() {
+        let dir = test_dir("symlink_remove");
+        let target = dir.join("target");
+        std::fs::create_dir_all(target.join("keep")).unwrap();
+        let keep = target.join("keep/file.txt");
+        std::fs::write(&keep, b"keep").unwrap();
+
+        let recursive_link = dir.join("recursive_link");
+        std::os::unix::fs::symlink(&target, &recursive_link).unwrap();
+        remove_local_recursive(&recursive_link.to_string_lossy()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&recursive_link).is_err(),
+            "递归删除应只删除链接本身"
+        );
+        assert!(keep.is_file(), "链接目标不能被递归删除");
+
+        let plain_link = dir.join("plain_link");
+        std::os::unix::fs::symlink(&target, &plain_link).unwrap();
+        let event = handle_local_cmd(
+            SftpCmd::Remove {
+                path: plain_link.to_string_lossy().into_owned(),
+                is_dir: false,
+            },
+            &dummy_tx(),
+        );
+        assert!(matches!(
+            event,
+            SftpEvent::OpDone {
+                op: "remove",
+                result: Ok(()),
+                ..
+            }
+        ));
+        assert!(
+            std::fs::symlink_metadata(&plain_link).is_err(),
+            "普通删除应 unlink 链接本身"
+        );
+        assert!(keep.is_file(), "普通删除不能删除链接目标");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn large_copy_resumes_matching_partial_and_commits() {
         let dir = test_dir("resume");
@@ -1313,6 +1868,65 @@ mod tests {
         );
         assert!(matches!(event, SftpEvent::OpDone { result: Err(_), .. }));
         assert_eq!(std::fs::read(&target).unwrap(), b"existing");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn editor_save_preserves_mode_and_rejects_external_changes() {
+        use sha2::{Digest as _, Sha256};
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = test_dir("editor-save");
+        let target = dir.join("config.conf");
+        std::fs::write(&target, b"before\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before: [u8; 32] = Sha256::digest(b"before\n").into();
+
+        write_local_editor_atomic(41, &target.to_string_lossy(), b"saved\n", Some(before)).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"saved\n");
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+
+        std::fs::write(&target, b"changed elsewhere\n").unwrap();
+        let stale: [u8; 32] = Sha256::digest(b"saved\n").into();
+        let error = write_local_editor_atomic(
+            42,
+            &target.to_string_lossy(),
+            b"would overwrite\n",
+            Some(stale),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, WriteFailureKind::Conflict);
+        assert_eq!(std::fs::read(&target).unwrap(), b"changed elsewhere\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_save_follows_symlink_without_replacing_it() {
+        use sha2::{Digest as _, Sha256};
+        use std::os::unix::fs::symlink;
+
+        let dir = test_dir("editor-save-symlink");
+        let target = dir.join("actual.conf");
+        let link = dir.join("linked.conf");
+        std::fs::write(&target, b"before").unwrap();
+        symlink(&target, &link).unwrap();
+        let expected: [u8; 32] = Sha256::digest(b"before").into();
+
+        write_local_editor_atomic(43, &link.to_string_lossy(), b"after", Some(expected)).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"after");
         std::fs::remove_dir_all(dir).ok();
     }
 

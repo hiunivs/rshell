@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! macOS Dock 右键窗口列表。
 //!
 //! winit 持有 NSApplicationDelegate，不能替换它。这里只在它的运行时类上补充

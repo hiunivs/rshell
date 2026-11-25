@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 use crate::app::RShellApp;
 use crate::config::{
     ColorScheme, DEFAULT_TERMINAL_BACKGROUND_COLOR, DownloadPathMode, FileOpenMode,
@@ -5,6 +9,11 @@ use crate::config::{
     ThemeMode, UpdateChannel,
 };
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, ThemePreference, Ui, vec2};
+
+const RSHELL_ATTRIBUTION: &str = "Based on RShell";
+const RSHELL_COPYRIGHT: &str = "Copyright (C) 2026 hiunivs";
+const RSHELL_SOURCE_URL: &str = "https://github.com/hiunivs/rshell";
+const RSHELL_LICENSE_URL: &str = "https://github.com/hiunivs/rshell/blob/master/LICENSE";
 
 /// 设置窗口左侧页面。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,41 +43,59 @@ impl SettingsPage {
     }
 }
 
+fn settings_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("rshell_settings")
+}
+
 impl RShellApp {
+    pub(crate) fn open_settings_viewport(&mut self) {
+        self.show_settings = true;
+        self.focus_settings_viewport = true;
+        if self.settings_sub.is_none() {
+            self.settings_sub = Some(SettingsPage::General);
+        }
+    }
+
     pub(crate) fn show_settings_dialog(&mut self, ui: &mut Ui) {
         if !self.show_settings {
+            self.focus_settings_viewport = false;
             return;
         }
 
         let ctx = ui.ctx().clone();
-        let mut open = self.show_settings;
-        let mut title_close = false;
+        let focus_viewport = std::mem::take(&mut self.focus_settings_viewport);
         let mut config_changed = false;
         if self.settings_sub.is_none() {
             self.settings_sub = Some(SettingsPage::General);
         }
 
-        egui::Window::new("设置")
-            .id(egui::Id::new("settings_window_v3"))
-            .open(&mut open)
-            .collapsible(false)
-            .title_bar(false)
-            .resizable(false)
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .default_size([650.0, 420.0])
-            .frame(crate::ui::dialog::modal_frame(&ctx))
-            .show(&ctx, |ui| {
-                title_close = crate::ui::dialog::title_bar_with_height(
-                    ui,
-                    "设置",
-                    ui.available_width(),
-                    32.0,
-                );
-                Frame::new()
-                    .inner_margin(Margin::symmetric(14, 12))
-                    .show(ui, |ui| {
-                        crate::ui::dialog::polish_compact(ui);
+        ctx.show_viewport_immediate(
+            settings_viewport_id(),
+            egui::ViewportBuilder::default()
+                .with_title("RShell 设置")
+                .with_inner_size([650.0, 420.0])
+                .with_resizable(false),
+            |viewport_ui, viewport_class| {
+                let viewport_ctx = viewport_ui.ctx().clone();
+                if viewport_ctx.input(|input| input.viewport().close_requested()) {
+                    self.show_settings = false;
+                    return;
+                }
+                if focus_viewport && !matches!(viewport_class, egui::ViewportClass::EmbeddedWindow)
+                {
+                    apply_native_window_theme(&viewport_ctx, self.config.theme_mode);
+                    viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+
+                let content_frame = Frame::new()
+                    .fill(viewport_ui.visuals().window_fill())
+                    .inner_margin(Margin::symmetric(14, 12));
+                egui::CentralPanel::default()
+                    .frame(content_frame)
+                    .show(viewport_ui, |ui| {
+                        crate::ui::dialog::polish_page_compact(ui);
 
                         let height = ui.available_height();
                         let body_rect = egui::Rect::from_min_size(
@@ -149,7 +176,7 @@ impl RShellApp {
                                                 SettingsPage::General => {
                                                     self.show_general_settings_page(
                                                         ui,
-                                                        &ctx,
+                                                        &viewport_ctx,
                                                         &mut config_changed,
                                                     );
                                                 }
@@ -184,17 +211,14 @@ impl RShellApp {
                             );
                         });
                     });
-            });
+            },
+        );
 
-        if title_close {
-            open = false;
-        }
         if config_changed {
             self.settings_error = crate::config::save(&self.config)
                 .err()
                 .map(|error| format!("保存设置失败：{error:#}"));
         }
-        self.show_settings = open;
     }
 
     fn show_general_settings_page(
@@ -659,6 +683,25 @@ impl RShellApp {
                     }
                     ui.end_row();
                 });
+            ui.add_space(7.0);
+            match self.config.password_storage {
+                PasswordStorage::SystemKeyring => {
+                    ui.label(
+                        RichText::new("密码由 macOS 钥匙串或 Windows 凭据管理器保护")
+                            .weak()
+                            .small(),
+                    );
+                }
+                PasswordStorage::AppEncrypted => {
+                    ui.label(
+                        RichText::new(
+                            "兼容模式：密钥与密文均保存在 App 配置目录，整个目录泄露时无法保护密码",
+                        )
+                        .color(Color32::from_rgb(0xD9, 0x78, 0x32))
+                        .small(),
+                    );
+                }
+            }
         });
 
         ui.add_space(12.0);
@@ -830,6 +873,32 @@ impl RShellApp {
                         }
                     });
                     ui.end_row();
+
+                    settings_row_label(ui, "深色高亮主题");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if highlight_theme_picker(
+                            ui,
+                            "editor_hl_theme_dark",
+                            &mut self.config.editor.highlight_theme_dark,
+                            "base16-ocean.dark",
+                        ) {
+                            *config_changed = true;
+                        }
+                    });
+                    ui.end_row();
+
+                    settings_row_label(ui, "浅色高亮主题");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if highlight_theme_picker(
+                            ui,
+                            "editor_hl_theme_light",
+                            &mut self.config.editor.highlight_theme_light,
+                            "InspiredGitHub",
+                        ) {
+                            *config_changed = true;
+                        }
+                    });
+                    ui.end_row();
                 });
         });
 
@@ -986,9 +1055,54 @@ fn show_about_settings_page(ui: &mut Ui) {
                     .color(secondary)
                     .size(11.0),
             );
-            ui.add_space(10.0);
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(RichText::new(RSHELL_ATTRIBUTION).strong());
+            ui.label(RichText::new(RSHELL_COPYRIGHT).color(secondary).size(11.0));
+            ui.label(
+                RichText::new("社区版按 GNU AGPL v3 授权；不提供任何担保")
+                    .color(secondary)
+                    .size(11.0),
+            );
+            ui.hyperlink_to(RSHELL_SOURCE_URL, RSHELL_SOURCE_URL);
+            ui.hyperlink_to("查看许可证与传播条件", RSHELL_LICENSE_URL);
+            ui.label(
+                RichText::new("另提供单独书面商业授权")
+                    .color(secondary)
+                    .size(11.0),
+            );
+            ui.add_space(8.0);
         });
     });
+}
+
+/// 语法高亮主题下拉框;空字符串表示跟随内建默认。返回是否有修改。
+fn highlight_theme_picker(ui: &mut Ui, id: &str, value: &mut String, default_name: &str) -> bool {
+    let mut changed = false;
+    let selected = if value.is_empty() {
+        format!("默认 ({default_name})")
+    } else {
+        value.clone()
+    };
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(value.is_empty(), format!("默认 ({default_name})"))
+                .clicked()
+            {
+                value.clear();
+                changed = true;
+            }
+            for name in crate::ui::file_editor::available_highlight_themes() {
+                if ui.selectable_label(*value == name, &name).clicked() {
+                    *value = name;
+                    changed = true;
+                }
+            }
+        });
+    changed
 }
 
 fn theme_preference(theme: ThemeMode) -> ThemePreference {
@@ -1005,7 +1119,13 @@ pub(crate) fn apply_native_window_theme(ctx: &egui::Context, theme: ThemeMode) {
         ThemeMode::Dark => egui::SystemTheme::Dark,
         ThemeMode::Light => egui::SystemTheme::Light,
     };
-    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(native_theme));
+    ctx.send_viewport_cmd_to(
+        egui::ViewportId::ROOT,
+        egui::ViewportCommand::SetTheme(native_theme),
+    );
+    if ctx.viewport_id() != egui::ViewportId::ROOT {
+        ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(native_theme));
+    }
 }
 
 pub(crate) fn apply_color_scheme(ctx: &egui::Context, scheme: ColorScheme) {

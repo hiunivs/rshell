@@ -16,6 +16,8 @@
     <string>RShell</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 hiunivs</string>
     <key>CFBundleShortVersionString</key>
     <string>0.0.0</string>
     <key>CFBundleVersion</key>

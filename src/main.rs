@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 mod app;
 mod app_render_test;
 mod config;
@@ -17,6 +21,65 @@ mod term_view;
 mod ui;
 mod update;
 
+/// macOS/Metal 在长时间休眠/后台后可能拿不到新的 drawable；wgpu 把它映射为
+/// `CurrentSurfaceTexture::Timeout`。egui-wgpu 默认对 Timeout 直接跳帧，
+/// 会导致窗口一直停在旧画面/花屏。这里改为先强制重配 surface，连续多次
+/// 超时后重建 surface。
+fn wgpu_options() -> eframe::WgpuConfiguration {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TIMEOUT_STREAK: AtomicU32 = AtomicU32::new(0);
+
+    let mut config = eframe::WgpuConfiguration::default();
+    let fallback = config.on_surface_status.clone();
+    config.on_surface_status = std::sync::Arc::new(move |status| match status {
+        eframe::wgpu::CurrentSurfaceTexture::Timeout => {
+            let streak = TIMEOUT_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+            if streak >= 3 {
+                TIMEOUT_STREAK.store(0, Ordering::Relaxed);
+                eframe::egui_wgpu::SurfaceErrorAction::RecreateSurface
+            } else {
+                eframe::egui_wgpu::SurfaceErrorAction::Reconfigure
+            }
+        }
+        other => {
+            TIMEOUT_STREAK.store(0, Ordering::Relaxed);
+            fallback(other)
+        }
+    });
+    config
+}
+
+/// 强制下一帧重建字体图集并整张上传。
+///
+/// 窗口不可见期间 egui 的字体图集如果发生重建，纹理增量可能没有被上传；
+/// 重新激活后 CPU 侧 UV 与 GPU 纹理不一致，会让所有文字和纯色图形看起来
+/// “重影/花屏”。这里通过一次无视觉影响的 FontDefinitions 变化触发完整图集重建。
+pub(crate) fn force_font_texture_reupload(ctx: &egui::Context) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TOGGLE: AtomicBool = AtomicBool::new(false);
+
+    let mut definitions = ctx.fonts(|fonts| fonts.definitions().clone());
+    let Some(first) = definitions.font_data.keys().next().cloned() else {
+        return;
+    };
+    let second = definitions
+        .font_data
+        .keys()
+        .nth(1)
+        .cloned()
+        .unwrap_or_else(|| first.clone());
+    let refresh_family = egui::FontFamily::Name("rshell_texture_refresh".into());
+    // 没有任何控件使用这个字体族，只用来让 FontDefinitions 与上次不同。
+    let chain = if TOGGLE.fetch_xor(true, Ordering::Relaxed) {
+        vec![first]
+    } else {
+        vec![first, second]
+    };
+    definitions.families.insert(refresh_family, chain);
+    ctx.set_fonts(definitions);
+    ctx.request_repaint();
+}
+
 fn main() -> eframe::Result<()> {
     let loaded_config = config::load();
     let initial_window_size = loaded_config.window_size().unwrap_or([1280.0, 800.0]);
@@ -31,6 +94,7 @@ fn main() -> eframe::Result<()> {
             .with_titlebar_shown(false)
             .with_title_shown(true)
             .with_titlebar_buttons_shown(true),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
     eframe::run_native(
@@ -252,4 +316,47 @@ fn load_font_data(source: &fontdb::Source, index: u32) -> Option<egui::FontData>
     let mut data = egui::FontData::from_static(bytes);
     data.index = index;
     Some(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui_wgpu::SurfaceErrorAction;
+    use eframe::wgpu::CurrentSurfaceTexture;
+
+    #[test]
+    fn surface_timeout_reconfigures_then_recreates() {
+        let config = wgpu_options();
+        assert!(matches!(
+            (config.on_surface_status)(&CurrentSurfaceTexture::Timeout),
+            SurfaceErrorAction::Reconfigure
+        ));
+        assert!(matches!(
+            (config.on_surface_status)(&CurrentSurfaceTexture::Timeout),
+            SurfaceErrorAction::Reconfigure
+        ));
+        assert!(matches!(
+            (config.on_surface_status)(&CurrentSurfaceTexture::Timeout),
+            SurfaceErrorAction::RecreateSurface
+        ));
+        assert!(matches!(
+            (config.on_surface_status)(&CurrentSurfaceTexture::Occluded),
+            SurfaceErrorAction::SkipFrame
+        ));
+    }
+
+    #[test]
+    fn forced_font_reupload_changes_font_definitions() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(Default::default(), |_ui| {});
+        force_font_texture_reupload(&ctx);
+        let _ = ctx.run_ui(Default::default(), |_ui| {});
+        let definitions = ctx.fonts(|fonts| fonts.definitions().clone());
+        assert!(
+            definitions
+                .families
+                .contains_key(&egui::FontFamily::Name("rshell_texture_refresh".into())),
+            "强制重建字体图集应改变 FontDefinitions"
+        );
+    }
 }

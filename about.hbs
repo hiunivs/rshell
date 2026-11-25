@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RShell third-party licenses</title>
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; color: #202124; }
+    h1, h2 { line-height: 1.25; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #ddd; border-radius: 6px; padding: 1rem; background: #f7f7f7; }
+    .used-by { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>RShell third-party licenses</h1>
+  <p>Generated from the locked Cargo dependency graph. RShell itself is licensed separately under the terms in LICENSE and NOTICE.</p>
+  {{#each licenses}}
+  <section>
+    <h2>{{name}} ({{id}})</h2>
+    <p class="used-by">Used by:
+      {{#each used_by}}{{crate.name}} {{crate.version}}{{#unless @last}}, {{/unless}}{{/each}}
+    </p>
+    <pre>{{text}}</pre>
+  </section>
+  {{/each}}
+</body>
+</html>

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 hiunivs
+# SPDX-License-Identifier: AGPL-3.0-only
+# Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"

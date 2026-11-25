@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 use crate::app::RShellApp;
 use crate::config::{AppConfig, SavedConnection};
 use crate::ui::icons::Icon;
@@ -128,7 +132,7 @@ impl RShellApp {
             });
 
         if open_library {
-            self.show_library = true;
+            self.open_connection_library_viewport();
         }
         if open_local {
             self.open_local(ui.ctx());

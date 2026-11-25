@@ -1,7 +1,12 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 use crate::app::RShellApp;
 use crate::ui::file_manager::draw_folder_icon;
 use crate::ui::icons::{Icon, icon_button};
 use egui::{Color32, RichText, vec2};
+use zeroize::Zeroize as _;
 
 /// 密钥表单模式
 #[derive(Clone, PartialEq, Eq, Default)]
@@ -26,37 +31,56 @@ pub enum LcKeyMode {
 /// 连接库文件树的虚拟根节点，仅用于运行时折叠状态。
 const LIB_ROOT_NODE: &str = "\0rshell_all_root";
 
+fn connection_library_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("rshell_connection_library")
+}
+
 impl RShellApp {
+    pub(crate) fn open_connection_library_viewport(&mut self) {
+        self.show_library = true;
+        self.focus_library_viewport = true;
+    }
+
     /// 连接库窗口:左文件夹 / 右连接列表,可连接/删除
     pub(crate) fn show_conn_library(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if !self.show_library {
+            self.focus_library_viewport = false;
             // 允许启动页右键直接打开连接编辑窗口，而不必同时显示连接库主窗。
             self.show_lib_extras(&ctx);
             return;
         }
-        let mut open = self.show_library;
-        let mut title_close = false;
-        egui::Window::new("连接库")
-            .id(egui::Id::new("conn_library_window"))
-            .open(&mut open)
-            .collapsible(false)
-            .title_bar(false)
-            .default_size([780.0, 500.0])
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(ctx.content_rect().center())
-            .frame(crate::ui::dialog::modal_frame(&ctx))
-            .show(&ctx, |ui| {
-                title_close = crate::ui::dialog::title_bar_with_height(
-                    ui,
-                    "连接库",
-                    ui.available_width(),
-                    32.0,
-                );
-                egui::Frame::new()
-                    .inner_margin(egui::Margin::symmetric(14, 12))
-                    .show(ui, |ui| {
-                        crate::ui::dialog::polish_compact(ui);
+        let focus_viewport = std::mem::take(&mut self.focus_library_viewport);
+        ctx.show_viewport_immediate(
+            connection_library_viewport_id(),
+            egui::ViewportBuilder::default()
+                .with_title("RShell 连接库")
+                .with_inner_size([780.0, 500.0])
+                .with_min_inner_size([680.0, 400.0]),
+            |viewport_ui, viewport_class| {
+                let viewport_ctx = viewport_ui.ctx().clone();
+                if viewport_ctx.input(|input| input.viewport().close_requested()) {
+                    self.show_library = false;
+                    return;
+                }
+                if focus_viewport && !matches!(viewport_class, egui::ViewportClass::EmbeddedWindow)
+                {
+                    crate::ui::settings::apply_native_window_theme(
+                        &viewport_ctx,
+                        self.config.theme_mode,
+                    );
+                    viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    viewport_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+
+                let content_frame = egui::Frame::new()
+                    .fill(viewport_ui.visuals().window_fill())
+                    .inner_margin(egui::Margin::symmetric(14, 12));
+                egui::CentralPanel::default()
+                    .frame(content_frame)
+                    .show(viewport_ui, |ui| {
+                        crate::ui::dialog::polish_page_compact(ui);
                         // 工具栏
                         ui.horizontal(|ui| {
                             ui.with_layout(
@@ -213,6 +237,7 @@ impl RShellApp {
                                                 && let Some(folder) = self.lib_folder.clone()
                                             {
                                                 self.folder_delete_pending = Some(folder);
+                                                self.folder_delete_armed = false;
                                             }
                                         },
                                     );
@@ -305,12 +330,9 @@ impl RShellApp {
                             );
                         });
                     });
-            });
-        if title_close {
-            open = false;
-        }
-        self.show_library = open;
-        self.show_lib_extras(&ctx);
+                self.show_lib_extras(&viewport_ctx);
+            },
+        );
     }
 
     /// 左栏文件树：“全部”为根节点，各文件夹统一显示为它的子节点。
@@ -466,6 +488,7 @@ impl RShellApp {
                         .clicked()
                     {
                         self.folder_delete_pending = Some(f.clone());
+                        self.folder_delete_armed = false;
                         ui.close();
                     }
                 });
@@ -950,7 +973,7 @@ impl RShellApp {
         self.lc_host.clear();
         self.lc_port = "22".into();
         self.lc_user = "root".into();
-        self.lc_pass.clear();
+        self.lc_pass.zeroize();
         self.lc_remember = true;
         self.lc_key_mode = LcKeyMode::Password;
         self.lc_key_path.clear();
@@ -984,8 +1007,10 @@ impl RShellApp {
         };
         self.lc_key_path = c.key_path.clone();
         // 密码认证时回填 keyring 口令
+        self.lc_pass.zeroize();
         self.lc_pass = if matches!(self.lc_key_mode, LcKeyMode::Password) {
             crate::secrets::get(&crate::secrets::account_for(&c.user, &c.host, c.port))
+                .map(|value| value.expose().to_owned())
                 .unwrap_or_default()
         } else {
             String::new()
@@ -1196,6 +1221,9 @@ impl RShellApp {
             open = false;
         }
         self.lc_open = open;
+        if !open {
+            self.lc_pass.zeroize();
+        }
     }
 
     /// 分组选择器：只能选择连接库中存在的文件夹，也可放回根目录。
@@ -1214,6 +1242,7 @@ impl RShellApp {
     fn open_folder_new(&mut self) {
         self.folder_new_parent = self.lib_folder.clone().unwrap_or_default();
         self.folder_new_name.clear();
+        self.folder_new_focus = true;
         self.folder_new_open = true;
     }
 
@@ -1242,6 +1271,7 @@ impl RShellApp {
     fn open_folder_rename(&mut self, from: &str) {
         self.folder_rename_from = Some(from.to_string());
         self.folder_rename_to = from.rsplit('/').next().unwrap_or(from).to_string();
+        self.folder_rename_focus = true;
     }
 
     fn apply_folder_rename(&mut self) -> bool {
@@ -1319,41 +1349,65 @@ impl RShellApp {
             let parent = self.folder_new_parent.clone();
             let mut open = true;
             let mut close = false;
-            egui::Window::new("新建文件夹")
-                .id(egui::Id::new("conn_library_folder_new"))
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .pivot(egui::Align2::CENTER_CENTER)
-                .default_pos(ctx.content_rect().center())
-                .frame(crate::ui::dialog::window_frame(ctx))
-                .show(ctx, |ui| {
+            let title_close = crate::ui::dialog::compact_dialog_window(
+                ctx,
+                "新建文件夹",
+                Some(egui::Id::new("conn_library_folder_new")),
+                &mut open,
+                |ui| {
                     crate::ui::dialog::polish(ui);
                     ui.label(if parent.is_empty() {
                         "在根目录新建".to_string()
                     } else {
                         format!("在 [{parent}] 下新建")
                     });
+                    let name_id = egui::Id::new("conn_library_folder_new_name");
+                    let mut submit = false;
+                    let mut cancel = false;
                     ui.horizontal(|ui| {
                         ui.label("名称");
-                        ui.text_edit_singleline(&mut self.folder_new_name);
-                    });
-                    ui.horizontal(|ui| {
-                        let action_button_size = egui::vec2(56.0, 28.0);
-                        if crate::ui::dialog::compact_primary_button(ui, "创建").clicked()
-                            && self.apply_folder_new()
-                        {
-                            close = true;
+                        let resp = ui
+                            .add(egui::TextEdit::singleline(&mut self.folder_new_name).id(name_id));
+                        if std::mem::take(&mut self.folder_new_focus) {
+                            crate::ui::dialog::focus_text_input(
+                                &resp,
+                                ui,
+                                name_id,
+                                self.folder_new_name.chars().count(),
+                            );
                         }
-                        if ui
-                            .add_sized(action_button_size, egui::Button::new("取消"))
-                            .clicked()
-                        {
-                            close = true;
-                        }
+                        submit |=
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     });
-                });
-            if close {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let action_button_size = egui::vec2(56.0, 28.0);
+                            submit |=
+                                crate::ui::dialog::compact_primary_button(ui, "创建").clicked();
+                            cancel |= ui
+                                .add_sized(action_button_size, egui::Button::new("取消"))
+                                .clicked();
+                        },
+                    );
+                    cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if submit {
+                        crate::ui::dialog::consume_handled_key(ui, egui::Key::Enter);
+                        if self.apply_folder_new() {
+                            close = true;
+                        } else {
+                            // 名称无效/重名时把焦点留回弹窗。
+                            self.folder_new_focus = true;
+                        }
+                    }
+                    if cancel {
+                        crate::ui::dialog::consume_handled_key(ui, egui::Key::Escape);
+                        close = true;
+                    }
+                },
+            );
+            if title_close || close {
                 open = false;
             }
             if !open {
@@ -1363,36 +1417,62 @@ impl RShellApp {
         if self.folder_rename_from.is_some() {
             let mut open = true;
             let mut close = false;
-            egui::Window::new("重命名文件夹")
-                .id(egui::Id::new("conn_library_folder_rename"))
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .pivot(egui::Align2::CENTER_CENTER)
-                .default_pos(ctx.content_rect().center())
-                .frame(crate::ui::dialog::window_frame(ctx))
-                .show(ctx, |ui| {
+            let title_close = crate::ui::dialog::compact_dialog_window(
+                ctx,
+                "重命名文件夹",
+                Some(egui::Id::new("conn_library_folder_rename")),
+                &mut open,
+                |ui| {
                     crate::ui::dialog::polish(ui);
+                    let name_id = egui::Id::new("conn_library_folder_rename_name");
+                    let mut submit = false;
+                    let mut cancel = false;
                     ui.horizontal(|ui| {
                         ui.label("新名称");
-                        ui.text_edit_singleline(&mut self.folder_rename_to);
-                    });
-                    ui.horizontal(|ui| {
-                        let action_button_size = egui::vec2(56.0, 28.0);
-                        if crate::ui::dialog::compact_primary_button(ui, "确定").clicked()
-                            && self.apply_folder_rename()
-                        {
-                            close = true;
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.folder_rename_to).id(name_id),
+                        );
+                        if std::mem::take(&mut self.folder_rename_focus) {
+                            crate::ui::dialog::focus_text_input(
+                                &resp,
+                                ui,
+                                name_id,
+                                self.folder_rename_to.chars().count(),
+                            );
                         }
-                        if ui
-                            .add_sized(action_button_size, egui::Button::new("取消"))
-                            .clicked()
-                        {
-                            close = true;
-                        }
+                        // 单行文本框回车会交出焦点，在这里确认，避免回车落到下层终端。
+                        submit |=
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     });
-                });
-            if close {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let action_button_size = egui::vec2(56.0, 28.0);
+                            submit |=
+                                crate::ui::dialog::compact_primary_button(ui, "确定").clicked();
+                            cancel |= ui
+                                .add_sized(action_button_size, egui::Button::new("取消"))
+                                .clicked();
+                        },
+                    );
+                    cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if submit {
+                        crate::ui::dialog::consume_handled_key(ui, egui::Key::Enter);
+                        if !self.folder_rename_to.trim().is_empty() && self.apply_folder_rename() {
+                            close = true;
+                        } else {
+                            // 名称无效/重名时保留弹窗焦点，别掉到下层终端。
+                            self.folder_rename_focus = true;
+                        }
+                    }
+                    if cancel {
+                        crate::ui::dialog::consume_handled_key(ui, egui::Key::Escape);
+                        close = true;
+                    }
+                },
+            );
+            if title_close || close {
                 open = false;
             }
             if !open {
@@ -1403,36 +1483,51 @@ impl RShellApp {
             let mut open = true;
             let mut close = false;
             let mut confirm = false;
-            egui::Window::new("删除文件夹")
-                .id(egui::Id::new("conn_library_folder_delete"))
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .pivot(egui::Align2::CENTER_CENTER)
-                .default_pos(ctx.content_rect().center())
-                .frame(crate::ui::dialog::window_frame(ctx))
-                .show(ctx, |ui| {
+            let title_close = crate::ui::dialog::compact_dialog_window(
+                ctx,
+                "删除文件夹",
+                Some(egui::Id::new("conn_library_folder_delete")),
+                &mut open,
+                |ui| {
                     crate::ui::dialog::polish(ui);
                     ui.label(format!("确定删除“{}”吗？", folder_name(&folder)));
                     ui.label(RichText::new("此操作无法撤销。").weak());
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let action_button_size = egui::vec2(56.0, 28.0);
-                        confirm =
-                            crate::ui::dialog::compact_destructive_button(ui, "删除").clicked();
-                        if ui
-                            .add_sized(action_button_size, egui::Button::new("取消"))
-                            .clicked()
-                        {
-                            close = true;
-                        }
-                    });
-                });
+                    let mut cancel = false;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let action_button_size = egui::vec2(56.0, 28.0);
+                            confirm |=
+                                crate::ui::dialog::compact_destructive_button(ui, "删除").clicked();
+                            cancel |= ui
+                                .add_sized(action_button_size, egui::Button::new("取消"))
+                                .clicked();
+                        },
+                    );
+                    let armed = std::mem::replace(&mut self.folder_delete_armed, true);
+                    if armed && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        confirm = true;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        confirm = false;
+                        cancel = true;
+                    }
+                    if confirm {
+                        crate::ui::dialog::consume_handled_key(ui, egui::Key::Enter);
+                    }
+                    if cancel {
+                        crate::ui::dialog::consume_handled_key(ui, egui::Key::Escape);
+                        close = true;
+                    }
+                },
+            );
             if confirm {
                 self.delete_folder(&folder);
                 close = true;
             }
-            if close || !open {
+            if title_close || close || !open {
                 self.folder_delete_pending = None;
             }
         }
@@ -1450,6 +1545,7 @@ impl RShellApp {
             .map(|c| c.tags.join(", "))
             .unwrap_or_default();
         self.tag_edit_name = Some(name.to_string());
+        self.tag_edit_focus = true;
         self.tag_edit_value = tags;
     }
 
@@ -1480,15 +1576,33 @@ impl RShellApp {
             .show(ctx, |ui| {
                 crate::ui::dialog::polish(ui);
                 ui.label("逗号分隔");
-                ui.text_edit_singleline(&mut self.tag_edit_value);
+                let value_id = egui::Id::new("conn_library_tag_edit_value");
+                let mut submit = false;
+                let mut cancel = false;
+                let resp =
+                    ui.add(egui::TextEdit::singleline(&mut self.tag_edit_value).id(value_id));
+                if std::mem::take(&mut self.tag_edit_focus) {
+                    crate::ui::dialog::focus_text_input(
+                        &resp,
+                        ui,
+                        value_id,
+                        self.tag_edit_value.chars().count(),
+                    );
+                }
+                submit |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.horizontal(|ui| {
-                    if crate::ui::dialog::primary_button(ui, "保存").clicked() {
-                        self.save_tag_edit();
-                    }
-                    if ui.button("取消").clicked() {
-                        self.tag_edit_name = None;
-                    }
+                    submit |= crate::ui::dialog::primary_button(ui, "保存").clicked();
+                    cancel |= crate::ui::dialog::secondary_button(ui, "取消").clicked();
                 });
+                cancel |= ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if submit {
+                    crate::ui::dialog::consume_handled_key(ui, egui::Key::Enter);
+                    self.save_tag_edit();
+                }
+                if cancel {
+                    crate::ui::dialog::consume_handled_key(ui, egui::Key::Escape);
+                    self.tag_edit_name = None;
+                }
             });
         if !open {
             self.tag_edit_name = None;
@@ -1615,7 +1729,7 @@ impl RShellApp {
         self.key_form_mode = mode.clone();
         self.key_form_name.clear();
         self.key_form_path.clear();
-        self.key_form_pass.clear();
+        self.key_form_pass.zeroize();
         self.key_form_algo = crate::keys::KeyAlgo::Ed25519;
         self.key_form_error = None;
         if let KeyFormMode::Edit(id) = &mode
@@ -1624,6 +1738,7 @@ impl RShellApp {
             self.key_form_name = k.name.clone();
             self.key_form_path = k.path.clone();
         }
+        self.key_form_focus = true;
         self.key_form_open = true;
     }
 
@@ -1654,7 +1769,17 @@ impl RShellApp {
                     .spacing([10.0, 8.0])
                     .show(ui, |ui| {
                         ui.label("名称");
-                        ui.text_edit_singleline(&mut self.key_form_name);
+                        let name_id = egui::Id::new("conn_library_key_form_name");
+                        let name_resp =
+                            ui.add(egui::TextEdit::singleline(&mut self.key_form_name).id(name_id));
+                        if std::mem::take(&mut self.key_form_focus) {
+                            crate::ui::dialog::focus_text_input(
+                                &name_resp,
+                                ui,
+                                name_id,
+                                self.key_form_name.chars().count(),
+                            );
+                        }
                         ui.end_row();
                         if matches!(self.key_form_mode, KeyFormMode::Generate) {
                             ui.label("算法");
@@ -1702,23 +1827,38 @@ impl RShellApp {
                     ui.colored_label(Color32::from_rgb(0xE8, 0x4C, 0x3D), e.clone());
                 }
                 ui.add_space(8.0);
+                let mut submit = false;
+                let mut cancel = false;
                 ui.horizontal(|ui| {
                     let ok_label = match self.key_form_mode {
                         KeyFormMode::Generate => "生成",
                         KeyFormMode::Register => "登记",
                         KeyFormMode::Edit(_) => "保存",
                     };
-                    if crate::ui::dialog::primary_button(ui, ok_label).clicked()
-                        && self.apply_key_form()
-                    {
-                        close = true;
-                    }
-                    if ui.button("取消").clicked() {
-                        self.key_form_assign_to_lc = false;
-                        self.key_form_assign_to_edit = false;
-                        close = true;
-                    }
+                    submit |= crate::ui::dialog::primary_button(ui, ok_label).clicked();
+                    cancel |= crate::ui::dialog::secondary_button(ui, "取消").clicked();
                 });
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    submit = false;
+                    cancel = true;
+                }
+                if submit {
+                    crate::ui::dialog::consume_handled_key(ui, egui::Key::Enter);
+                    if self.apply_key_form() {
+                        close = true;
+                    } else {
+                        self.key_form_focus = true;
+                    }
+                }
+                if cancel {
+                    crate::ui::dialog::consume_handled_key(ui, egui::Key::Escape);
+                    self.key_form_assign_to_lc = false;
+                    self.key_form_assign_to_edit = false;
+                    close = true;
+                }
             });
         if close {
             open = false;
@@ -1727,6 +1867,7 @@ impl RShellApp {
         if !open {
             self.key_form_assign_to_lc = false;
             self.key_form_assign_to_edit = false;
+            self.key_form_pass.zeroize();
         }
     }
 
@@ -1736,7 +1877,7 @@ impl RShellApp {
             self.key_form_error = Some("名称不能为空".into());
             return false;
         }
-        let pass = self.key_form_pass.clone();
+        let pass = zeroize::Zeroizing::new(self.key_form_pass.clone());
         let pass_ref = if pass.is_empty() {
             None
         } else {

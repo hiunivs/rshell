@@ -36,6 +36,7 @@ export RSHELL_SPARKLE_PUBLIC_KEY='BASE64_PUBLIC_KEY'
 export RSHELL_MACOS_SIGN_IDENTITY='Developer ID Application: Example (TEAMID)'
 export RSHELL_APPLE_NOTARY_PROFILE=RShellNotary
 export SPARKLE_FRAMEWORK_PATH=/verified/Sparkle.framework
+export SPARKLE_LICENSE_PATH=/verified/LICENSE
 ./packaging/macos/package.sh
 ```
 
@@ -43,8 +44,10 @@ export SPARKLE_FRAMEWORK_PATH=/verified/Sparkle.framework
 
 1. 构建 Apple silicon 与 Intel 两种架构并合并为 Universal Binary。
 2. 嵌入 Sparkle，生成 Info.plist。
-3. 使用 Hardened Runtime 签名并验证整个 App Bundle。
-4. 提交 Apple Notarization、staple ticket，再生成最终 ZIP。
+3. 把 RShell、Rust 依赖、字体、图标和 Sparkle 的许可证材料写入 App Bundle。
+4. 使用 Hardened Runtime 签名并验证整个 App Bundle。
+5. 提交 Apple Notarization、staple ticket，再生成最终 ZIP。
+6. 从当前版本 tag 导出源码并通过 `cargo vendor --locked` 一并收录依赖源码。
 
 将最终 ZIP 放入仅包含待发布更新归档的目录，使用同一 Sparkle 发行版生成并签名 appcast：
 
@@ -100,6 +103,7 @@ $env:RSHELL_WINDOWS_PFX_PASSWORD = "<从 CI/本机 secret manager 注入>"
 ```text
 dist/windows/stable/RShell-<version>.msixbundle
 dist/windows/stable/RShell.appinstaller
+dist/source/RShell-<version>-source.zip
 ```
 
 发布测试版时增加 `-ReleaseChannel beta`，产物会写入 `dist/windows/beta`；同一构建内的稳定版和测试版 URL 都是编译期固定值。CI 中 macOS 和 Windows 的产物通道分别选择，测试版通道必须填写对应的 beta URL。
@@ -112,9 +116,11 @@ Web 服务器必须给 `.appinstaller`、`.msixbundle` 和 ZIP 返回正确的 C
 
 ## 发布权限
 
+- 正式构建要求工作区干净，且当前提交必须存在与 `Cargo.toml` 完全一致的 `v<version>` tag；例如版本 `0.1.1` 必须从 `v0.1.1` 构建。
 - 签名、notarization、appcast 生成只允许从受保护的 release tag/environment 运行，不能在来自 fork 的 PR 中运行。
 - Developer ID 私钥、Sparkle EdDSA 私钥、PFX 密码分别保存；任何私钥都不能写入仓库或应用包。
 - 上传版本文件后最后替换稳定的 appcast/`.appinstaller`，避免清单先指向尚未上传的包。
+- 对应的 `*-source.tar.gz` 或 `*-source.zip` 必须与二进制放在同一发布位置并保持可访问；只要仍提供该二进制，就不能提前删除其对应源码。
 - 保留至少一个已知可用的旧安装包。回滚时发布版本号更高、内容恢复到旧实现的新包，不降低版本号。
 
 ## 必测场景
@@ -306,13 +312,17 @@ windows_publisher_display_name:  Example Technology
 ```text
 macOS:
 RShell-<version>.zip
+RShell-<version>-source.tar.gz
 appcast.xml
 
 Windows:
 RShell-<version>.msixbundle
 RShell.appinstaller
+RShell-<version>-source.zip
 ```
 
-工作流不会自动上传到生产更新服务器。人工验证后，必须先上传带版本号的 ZIP 或 MSIX Bundle，确认下载地址可用，最后再原子替换稳定地址下的 `appcast.xml` 或 `RShell.appinstaller`，避免客户端拿到指向不存在安装包的清单。
+工作流首先用固定版本的 `cargo-about` 重新生成 Rust 锁定依赖的许可证报告，并与仓库中的 `THIRD_PARTY_LICENSES.html` 比对；报告过期或出现未接受许可证时会中止发布。macOS 与 Windows 安装包都会携带项目许可证、第三方许可证报告以及直接嵌入资源的许可证正文。
+
+工作流不会自动上传到生产更新服务器。人工验证后，必须先上传带版本号的 ZIP 或 MSIX Bundle 及同版本源码归档，确认二进制和源码下载地址均可用，最后再原子替换稳定地址下的 `appcast.xml` 或 `RShell.appinstaller`，避免客户端拿到指向不存在安装包的清单。
 
 工作流中的第三方 Action 使用不可变提交 SHA，Rust 工具链由仓库根目录的 `rust-toolchain.toml` 固定。

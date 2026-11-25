@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 安全的软件更新入口。
 //!
 //! 这里不下载、解压或覆盖当前可执行文件。macOS 将安装过程交给 Sparkle，

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 系统监控:远程主机通过一条 SSH exec 命令采集 /proc、ps、df 并解析;
 //! 本机用 sysinfo。解析函数为纯函数,配单元测试。
 
@@ -104,8 +108,18 @@ pub const MONITOR_DYNAMIC_CMD: &str = concat!(
     "echo =LOAD; cat /proc/loadavg;",
     "echo =UP; cat /proc/uptime;",
     "echo =MEM; cat /proc/meminfo;",
-    "echo =NET; cat /proc/net/dev;",
-    "echo =PS; ps -eo rss,pcpu,comm 2>/dev/null;"
+    "echo =NET; cat /proc/net/dev;"
+);
+
+/// 进程列表比其他动态指标大得多，按较低频率附加到动态采样命令中。
+pub const MONITOR_PROCESSES_CMD: &str = concat!(
+    "echo =PS; ",
+    "all=$(ps -eo pid=,rss=,pcpu=,comm= 2>/dev/null); ",
+    "if [ -z \"$all\" ]; then all=$(ps -eo pid,rss,pcpu,comm 2>/dev/null | tail -n +2); fi; ",
+    "if [ -n \"$all\" ]; then { ",
+    "printf '%s\\n' \"$all\" | sort -k2,2nr | head -n 10; ",
+    "printf '%s\\n' \"$all\" | sort -k3,3nr | head -n 10; ",
+    "} | awk '!seen[$1]++'; fi;"
 );
 
 /// 文件系统变化慢，独立降低采样频率。
@@ -386,16 +400,40 @@ fn parse_size_kb(s: &str) -> u64 {
     (n * mult) as u64
 }
 
-/// "  43628  2.0 AliYunDun" → ProcInfo;表头行返回 None
+/// "123 43628 2.0 AliYunDun" → ProcInfo；兼容旧的无 PID 格式。
 pub fn parse_ps_line(line: &str) -> Option<ProcInfo> {
-    let mut it = line.split_whitespace();
-    let first = it.next()?;
-    if first == "RSS" {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields
+        .first()
+        .is_some_and(|field| *field == "RSS" || *field == "PID")
+    {
         return None;
     }
-    let rss_kb: u64 = first.parse().ok()?;
-    let cpu: f32 = it.next()?.parse().ok()?;
-    let command = it.next().unwrap_or("?").to_string();
+    let (rss_kb, cpu, command_index) = fields
+        .first()
+        .zip(fields.get(1))
+        .zip(fields.get(2))
+        .and_then(|((pid, rss), cpu)| {
+            Some((
+                pid.parse::<u32>().ok()?,
+                rss.parse::<u64>().ok()?,
+                cpu.parse::<f32>().ok()?,
+            ))
+        })
+        .map_or_else(
+            || {
+                Some((
+                    fields.first()?.parse::<u64>().ok()?,
+                    fields.get(1)?.parse::<f32>().ok()?,
+                    2,
+                ))
+            },
+            |(_, rss, cpu)| Some((rss, cpu, 3)),
+        )?;
+    let command = fields.get(command_index..)?.join(" ");
+    if command.is_empty() {
+        return None;
+    }
     Some(ProcInfo {
         rss_kb,
         cpu,
@@ -609,6 +647,33 @@ BogoMIPS:                        5599.85
         assert_eq!(p.rss_kb, 44608);
         assert!((p.cpu - 2.0).abs() < 0.01);
         assert_eq!(p.command, "AliYunDunMonito");
+        let p = parse_ps_line("44608 2.0 python worker").unwrap();
+        assert_eq!(p.rss_kb, 44608);
+        assert_eq!(p.command, "python worker");
+        let p = parse_ps_line("123 44608 2.0 AliYunDunMonito").unwrap();
+        assert_eq!(p.rss_kb, 44608);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_command_returns_only_top_candidates() {
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(MONITOR_PROCESSES_CMD)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        let rows = text
+            .lines()
+            .filter(|line| *line != "=PS")
+            .collect::<Vec<_>>();
+        assert!(
+            rows.len() <= 20,
+            "unexpected process row count: {}",
+            rows.len()
+        );
+        assert!(rows.iter().all(|line| parse_ps_line(line).is_some()));
     }
 
     #[test]

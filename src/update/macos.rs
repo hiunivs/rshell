@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 use super::{UpdateAction, UpdateBackend, secure_update_url};
 use crate::config::UpdateChannel;
 use objc2::rc::Retained;

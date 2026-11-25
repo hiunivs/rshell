@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 use crate::app::{MonitorView, ProcSort, RShellApp};
 use crate::session::monitor::SystemMetrics;
 use egui::{Color32, Pos2, RichText, Stroke, vec2};
@@ -313,10 +317,19 @@ fn sidebar_copy_button(ui: &mut egui::Ui) -> egui::Response {
 /// 系统信息:运行时间、负载、CPU/内存/交换。
 /// 标题是带边框和填充的按钮(一眼可知可点),返回是否被点击
 fn sidebar_sysinfo(ui: &mut egui::Ui, m: Option<&SystemMetrics>) -> bool {
+    let button_h =
+        ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y;
     let open_detail = ui
-        .add(egui::Button::new("系统信息").frame_when_inactive(true))
-        .on_hover_text("打开详细系统信息页")
-        .clicked();
+        .allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), button_h),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.add(egui::Button::new("系统信息").frame_when_inactive(true))
+                    .on_hover_text("打开详细系统信息页")
+                    .clicked()
+            },
+        )
+        .inner;
     egui::Grid::new("sysinfo_grid").show(ui, |ui| {
         ui.label("运行");
         ui.label(m.map(|m| fmt_uptime(m.uptime_secs)).unwrap_or("—".into()));
@@ -554,6 +567,7 @@ fn sidebar_network(ui: &mut egui::Ui, monitor: &mut MonitorView) {
                 .map(|m| m.nets.iter().map(|n| n.name.clone()).collect())
                 .unwrap_or_default();
             ui.menu_button(cur, |ui| {
+                crate::ui::dialog::mark_modal(ui.ctx());
                 if ui
                     .selectable_label(monitor.net_sel.is_none(), "全部")
                     .clicked()

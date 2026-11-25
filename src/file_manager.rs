@@ -1,7 +1,11 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 文件管理器状态:当前目录、列表、排序、目录树缓存、传输任务。
 //! UI 在 ui/file_manager.rs,逻辑都在这里。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::session::files::{
@@ -44,6 +48,8 @@ pub struct Transfer {
     pub paused: bool,
     pub finished_at: Option<std::time::Instant>,
     pub error: Option<String>,
+    /// 上传成功后需要刷新的远端目录（下载时为 None）。
+    refresh_dir: Option<String>,
     speed_bps: f64,
     rate_sample_done: u64,
     rate_sample_at: std::time::Instant,
@@ -62,6 +68,7 @@ impl Transfer {
             paused: false,
             finished_at: None,
             error: None,
+            refresh_dir: None,
             speed_bps: 0.0,
             rate_sample_done: done,
             rate_sample_at: std::time::Instant::now(),
@@ -126,12 +133,21 @@ impl Transfer {
 pub struct FmDialogs {
     pub mkdir_open: bool,
     pub mkdir_name: String,
+    /// 弹窗刚打开：下一次绘制时聚焦名称框并全选，避免按键落到下层终端。
+    pub mkdir_focus: bool,
+    pub create_file_open: bool,
+    pub create_file_name: String,
+    pub create_file_focus: bool,
     pub rename_old: Option<String>,
     pub rename_name: String,
+    pub rename_focus: bool,
     /// (路径, 是否目录, 是否递归)
     pub delete_target: Option<(String, bool, bool)>,
+    /// 删除确认弹窗已经显示过至少一帧；避免打开弹窗的同一个回车立即确认删除。
+    pub delete_armed: bool,
     /// 权限对话框目标
     pub perm_target: Option<String>,
+    pub perm_armed: bool,
     /// 编辑中的权限位(低 9 位 rwxrwxrwx)
     pub perm_mode: u32,
     /// 原始完整 mode(含文件类型位,setstat 时保留类型位只改权限)
@@ -139,6 +155,9 @@ pub struct FmDialogs {
     /// 原始是否目录(显示 "d"/"-" 用)
     pub perm_is_dir: bool,
 }
+
+/// 目录树可见行：(路径, 深度, 是否展开, 是否加载中, 是否符号链接目录)
+pub(crate) type TreeRow = (String, usize, bool, bool, bool);
 
 pub struct FileManager {
     pub cwd: String,
@@ -157,7 +176,9 @@ pub struct FileManager {
     pub tree_expanded: HashSet<String>,
     pub tree_children: HashMap<String, Vec<FileEntry>>,
     pub tree_loading: HashSet<String>,
-    tree_rows_cache: Arc<Vec<(String, usize, bool, bool)>>,
+    /// 导航后等待目录树把当前目录滚动到可视区域；节点尚未加载时保持请求。
+    pub tree_scroll_to_cwd: bool,
+    tree_rows_cache: Arc<Vec<TreeRow>>,
     tree_rows_dirty: bool,
     // 传输
     pub transfers: Vec<Transfer>,
@@ -179,11 +200,11 @@ pub struct FileManager {
     /// UI 请求用本地程序打开的文件(右键菜单产生,app 层消费)
     pub request_external_open: Option<FileEntry>,
     /// ReadFile 结果收件箱(app 层取走)
-    pub preview_inbox: Option<(u64, String, Result<Vec<u8>, String>)>,
+    pub preview_inbox: VecDeque<(u64, String, Result<Vec<u8>, String>)>,
     /// DetectKind 结果收件箱(app 层取走)
-    pub kind_inbox: Option<(u64, String, Result<String, String>)>,
+    pub kind_inbox: VecDeque<(u64, String, Result<String, String>)>,
     /// WriteFile(编辑器保存)结果收件箱(app 层取走)
-    pub write_inbox: Option<(u64, Result<(), String>)>,
+    pub write_inbox: VecDeque<(u64, crate::session::files::WriteResult)>,
 }
 
 /// 通用操作 ID(预览/编辑/外部打开)——与传输 ID 共用同一计数器,
@@ -208,6 +229,7 @@ impl FileManager {
             tree_expanded: HashSet::from(["/".to_string()]),
             tree_children: HashMap::new(),
             tree_loading: HashSet::new(),
+            tree_scroll_to_cwd: true,
             tree_rows_cache: Arc::new(Vec::new()),
             tree_rows_dirty: true,
             transfers: Vec::new(),
@@ -221,9 +243,9 @@ impl FileManager {
             next_transfer_id: 1,
             request_preview: None,
             request_external_open: None,
-            preview_inbox: None,
-            kind_inbox: None,
-            write_inbox: None,
+            preview_inbox: VecDeque::new(),
+            kind_inbox: VecDeque::new(),
+            write_inbox: VecDeque::new(),
         }
     }
 
@@ -316,6 +338,24 @@ impl FileManager {
 
     pub fn navigate(&mut self, path: &str) {
         let norm = normalize_path(path);
+        self.set_current_directory(&norm);
+        self.reveal_in_tree(&norm);
+    }
+
+    /// 从左侧目录树单击选择目录。更新右侧文件列表，但只展开祖先链，
+    /// 不改变当前节点自己的展开状态；该节点由双击或箭头控制展开。
+    pub fn select_tree_path(&mut self, path: &str) {
+        let norm = normalize_path(path);
+        self.set_current_directory(&norm);
+        // 鼠标刚点击的行已经可见，不要在两次点击之间自动滚动，
+        // 否则节点可能移出指针位置，导致双击无法成立。
+        self.tree_scroll_to_cwd = false;
+        if norm != "/" {
+            self.reveal_in_tree(&parent_path(&norm));
+        }
+    }
+
+    fn set_current_directory(&mut self, norm: &str) {
         if norm != self.cwd {
             if !self.history.contains(&self.cwd) {
                 self.history.push(self.cwd.clone());
@@ -323,17 +363,17 @@ impl FileManager {
                     self.history.remove(0);
                 }
             }
-            self.cwd = norm.clone();
+            self.cwd = norm.to_string();
         }
-        self.path_edit = norm.clone();
+        self.path_edit = norm.to_string();
         self.selected = None;
+        self.tree_scroll_to_cwd = true;
         // 允许重复请求(刷新当前目录数据)
-        self.tree_loading.remove(&norm);
-        self.request_list(&norm);
-        self.reveal_in_tree(&norm);
+        self.tree_loading.remove(norm);
+        self.request_list(norm);
     }
 
-    /// 在目录树中展开 path 的祖先链,缺失的目录数据自动请求
+    /// 在目录树中展开 path 及其祖先链,缺失的目录数据自动请求
     pub fn reveal_in_tree(&mut self, path: &str) {
         let norm = normalize_path(path);
         let mut cur = "/".to_string();
@@ -348,9 +388,6 @@ impl FileManager {
             } else {
                 format!("{cur}/{seg}")
             };
-            if next == norm {
-                break; // 当前目录本身不必展开,高亮即可
-            }
             self.tree_expanded.insert(next.clone());
             self.tree_rows_dirty = true;
             if !self.tree_children.contains_key(&next) {
@@ -375,11 +412,18 @@ impl FileManager {
     }
 
     pub fn refresh(&mut self) {
+        let cwd = self.cwd.clone();
+        self.refresh_directory(&cwd);
+    }
+
+    /// 刷新指定目录。上传的目标目录可能已经不是当前 cwd，仍需更新其列表/
+    /// 目录树缓存，而不是去刷新用户当前所在的目录。
+    fn refresh_directory(&mut self, path: &str) {
         // 不清理 tree_children:旧数据留到新数据到达(Listed 时整体替换),
         // 否则目录树先塌陷再展开,下面的节点视觉上上下跳动
-        let cwd = self.cwd.clone();
-        self.tree_loading.remove(&cwd);
-        self.request_list(&cwd);
+        let dir = normalize_path(path);
+        self.tree_loading.remove(&dir);
+        self.request_list(&dir);
     }
 
     pub fn toggle_tree(&mut self, path: &str) {
@@ -461,10 +505,8 @@ impl FileManager {
                 }
             }
             SftpEvent::OpDone { id, op, result } => {
-                if op == "write" {
-                    // 编辑器保存完成:不触发目录刷新,交给 app 层的编辑器状态
-                    self.write_inbox = id.map(|id| (id, result));
-                } else if matches!(op, "download" | "upload" | "download_dir" | "upload_dir") {
+                if matches!(op, "download" | "upload" | "download_dir" | "upload_dir") {
+                    let mut refresh_dir = None;
                     if let Some(t) =
                         id.and_then(|id| self.transfers.iter_mut().find(|t| t.id == id))
                     {
@@ -473,10 +515,17 @@ impl FileManager {
                         t.finished_at = Some(std::time::Instant::now());
                         if let Err(e) = &result {
                             t.error = Some(e.clone());
+                        } else {
+                            refresh_dir = t.refresh_dir.clone();
                         }
                     }
-                    if let Err(e) = result {
+                    if let Err(e) = &result {
                         self.error = Some(format!("{op} 失败:{e}"));
+                    }
+                    // 上传完成后目录里多了文件/目录，必须刷新目标目录，
+                    // 否则用户得手动点“刷新”才能看到刚上传的内容。
+                    if let Some(dir) = refresh_dir {
+                        self.refresh_directory(&dir);
                     }
                 } else {
                     match result {
@@ -484,6 +533,10 @@ impl FileManager {
                         Err(e) => self.error = Some(format!("{op} 失败:{e}")),
                     }
                 }
+            }
+            SftpEvent::FileWritten { id, result } => {
+                // 允许同一帧完成多个编辑器保存，不能用单个 Option 覆盖先到的事件。
+                self.write_inbox.push_back((id, result));
             }
             SftpEvent::Progress {
                 id,
@@ -501,28 +554,28 @@ impl FileManager {
                 }
             }
             SftpEvent::FileContent { id, path, result } => {
-                self.preview_inbox = Some((id, path, result));
+                self.preview_inbox.push_back((id, path, result));
             }
             SftpEvent::KindDetected { id, path, result } => {
-                self.kind_inbox = Some((id, path, result));
+                self.kind_inbox.push_back((id, path, result));
             }
         }
     }
 
-    pub fn visible_tree_rows(&mut self) -> Arc<Vec<(String, usize, bool, bool)>> {
+    pub fn visible_tree_rows(&mut self) -> Arc<Vec<TreeRow>> {
         if self.tree_rows_dirty {
             let mut rows = Vec::new();
-            let mut stack = vec![("/".to_string(), 0usize)];
-            while let Some((path, depth)) = stack.pop() {
+            let mut stack = vec![("/".to_string(), 0usize, false)];
+            while let Some((path, depth, is_symlink)) = stack.pop() {
                 let expanded = self.tree_expanded.contains(&path);
                 let loading = self.tree_loading.contains(&path);
-                rows.push((path.clone(), depth, expanded, loading));
+                rows.push((path.clone(), depth, expanded, loading, is_symlink));
                 if expanded
                     && depth < 16
                     && let Some(children) = self.tree_children.get(&path)
                 {
                     for child in children.iter().rev() {
-                        stack.push((child.full_path(&path), depth + 1));
+                        stack.push((child.full_path(&path), depth + 1, child.is_symlink));
                     }
                 }
             }
@@ -620,8 +673,9 @@ impl FileManager {
             self.error = Some(error);
             return;
         }
-        self.transfers
-            .push(Transfer::new(id, "upload_dir", local_path, 0, 0));
+        let mut transfer = Transfer::new(id, "upload_dir", local_path, 0, 0);
+        transfer.refresh_dir = Some(self.cwd.clone());
+        self.transfers.push(transfer);
     }
 
     /// 上传本地文件到当前目录
@@ -642,8 +696,9 @@ impl FileManager {
             self.error = Some(error);
             return;
         }
-        self.transfers
-            .push(Transfer::new(id, "upload", local_path, 0, total));
+        let mut transfer = Transfer::new(id, "upload", local_path, 0, total);
+        transfer.refresh_dir = Some(self.cwd.clone());
+        self.transfers.push(transfer);
     }
 
     fn next_transfer_id(&mut self) -> u64 {
@@ -689,6 +744,166 @@ impl FileManager {
 mod tests {
     use super::*;
 
+    fn directory(name: &str) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            is_dir: true,
+            size: 0,
+            mtime: 0,
+            permissions: 0o40755,
+            uid: 0,
+            gid: 0,
+            owner: String::new(),
+            group: String::new(),
+            is_symlink: false,
+            is_broken_symlink: false,
+        }
+    }
+
+    #[test]
+    fn local_mkdir_refreshes_listing_without_manual_refresh() {
+        use crate::session::SessionEvent;
+        use std::time::{Duration, Instant};
+
+        let root =
+            std::env::temp_dir().join(format!("rshell_fm_mkdir_refresh_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = egui::Context::default();
+        let (sftp_tx, sftp_rx) = tokio::sync::mpsc::channel(64);
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        crate::session::files::spawn_local_worker(sftp_rx, event_tx, ctx);
+
+        let mut manager = FileManager::new(Some(sftp_tx));
+        manager.cwd = root.to_string_lossy().into_owned();
+        manager.path_edit = manager.cwd.clone();
+        manager.started = true;
+        let cwd = manager.cwd.clone();
+        manager.request_list(&cwd);
+
+        let pump = |manager: &mut FileManager| {
+            while let Ok(event) = event_rx.try_recv() {
+                if let SessionEvent::Sftp(event) = event {
+                    manager.handle_event(event);
+                }
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manager.loading && Instant::now() < deadline {
+            pump(&mut manager);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!manager.loading, "初始目录列表应完成");
+
+        let created = root.join("created-dir");
+        manager
+            .send(SftpCmd::Mkdir(created.to_string_lossy().into_owned()))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut found = false;
+        while Instant::now() < deadline {
+            pump(&mut manager);
+            if manager
+                .entries
+                .iter()
+                .any(|entry| entry.name == "created-dir")
+            {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(found, "新建目录后列表应自动刷新，无需手动点刷新");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn successful_upload_refreshes_the_upload_target_directory() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut manager = FileManager::new(Some(tx));
+        manager.cwd = "/srv/app".into();
+        manager.start_upload("/tmp/new-file.bin".into());
+        let id = loop {
+            match rx.try_recv().expect("upload command") {
+                SftpCmd::Upload { id, .. } => break id,
+                SftpCmd::List(_) => panic!("上传前不应刷新"),
+                _ => {}
+            }
+        };
+
+        // 上传本身不应该提前刷新
+        while let Ok(cmd) = rx.try_recv() {
+            assert!(!matches!(cmd, SftpCmd::List(_)));
+        }
+
+        manager.handle_event(SftpEvent::OpDone {
+            id: Some(id),
+            op: "upload",
+            result: Ok(()),
+        });
+
+        let mut listed = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let SftpCmd::List(path) = cmd {
+                listed.push(path);
+            }
+        }
+        assert_eq!(
+            listed,
+            vec!["/srv/app".to_string()],
+            "上传完成后应自动刷新目标目录"
+        );
+    }
+
+    #[test]
+    fn successful_upload_dir_refreshes_the_parent_directory() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut manager = FileManager::new(Some(tx));
+        manager.cwd = "/srv/app".into();
+        manager.start_upload_dir("/tmp/new-dir".into());
+
+        let id = loop {
+            match rx.try_recv().expect("upload_dir command") {
+                SftpCmd::UploadDir { id, .. } => break id,
+                SftpCmd::List(_) => panic!("upload_dir 前不应刷新"),
+                _ => {}
+            }
+        };
+        manager.handle_event(SftpEvent::OpDone {
+            id: Some(id),
+            op: "upload_dir",
+            result: Ok(()),
+        });
+
+        let mut listed = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let SftpCmd::List(path) = cmd {
+                listed.push(path);
+            }
+        }
+        assert_eq!(listed, vec!["/srv/app".to_string()]);
+    }
+
+    #[test]
+    fn successful_mkdir_refreshes_the_current_directory() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut manager = FileManager::new(Some(tx));
+        manager.cwd = "/srv/app".into();
+        manager.handle_event(SftpEvent::OpDone {
+            id: None,
+            op: "mkdir",
+            result: Ok(()),
+        });
+        let mut listed = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let SftpCmd::List(path) = cmd {
+                listed.push(path);
+            }
+        }
+        assert_eq!(listed, vec!["/srv/app".to_string()]);
+    }
+
     #[test]
     fn completion_matches_transfer_id_not_operation_order() {
         let mut manager = FileManager::new(None);
@@ -730,5 +945,128 @@ mod tests {
         manager.start_upload("/does/not/exist".into());
         assert!(manager.transfers.is_empty());
         assert_eq!(manager.error.as_deref(), Some("文件服务尚未就绪"));
+    }
+
+    #[test]
+    fn editor_write_results_are_queued_without_overwriting() {
+        use crate::session::files::{WriteFailure, WriteFailureKind};
+
+        let mut manager = FileManager::new(None);
+        manager.handle_event(SftpEvent::FileWritten {
+            id: 11,
+            result: Ok(()),
+        });
+        manager.handle_event(SftpEvent::FileWritten {
+            id: 12,
+            result: Err(WriteFailure::new(WriteFailureKind::Conflict, "changed")),
+        });
+
+        assert_eq!(manager.write_inbox.len(), 2);
+        assert_eq!(manager.write_inbox.pop_front().unwrap().0, 11);
+        let (id, result) = manager.write_inbox.pop_front().unwrap();
+        assert_eq!(id, 12);
+        assert_eq!(result.unwrap_err().kind, WriteFailureKind::Conflict);
+    }
+
+    #[test]
+    fn concurrent_preview_results_are_queued_without_overwriting() {
+        let mut manager = FileManager::new(None);
+        manager.handle_event(SftpEvent::FileContent {
+            id: 21,
+            path: "/tmp/first".into(),
+            result: Ok(b"first".to_vec()),
+        });
+        manager.handle_event(SftpEvent::FileContent {
+            id: 22,
+            path: "/tmp/second".into(),
+            result: Ok(b"second".to_vec()),
+        });
+
+        assert_eq!(manager.preview_inbox.len(), 2);
+        assert_eq!(manager.preview_inbox.pop_front().unwrap().0, 21);
+        assert_eq!(manager.preview_inbox.pop_front().unwrap().0, 22);
+    }
+
+    #[test]
+    fn navigation_expands_and_reveals_the_current_directory() {
+        let mut manager = FileManager::new(None);
+        manager.cwd = "/".into();
+        manager.tree_expanded.clear();
+        manager.tree_scroll_to_cwd = false;
+        manager
+            .tree_children
+            .insert("/".into(), vec![directory("srv")]);
+        manager
+            .tree_children
+            .insert("/srv".into(), vec![directory("app")]);
+        manager
+            .tree_children
+            .insert("/srv/app".into(), vec![directory("logs")]);
+        manager
+            .tree_children
+            .insert("/srv/app/logs".into(), vec![directory("archive")]);
+
+        manager.navigate("/srv/app/logs");
+
+        assert_eq!(manager.cwd, "/srv/app/logs");
+        assert!(manager.tree_scroll_to_cwd);
+        for path in ["/", "/srv", "/srv/app", "/srv/app/logs"] {
+            assert!(
+                manager.tree_expanded.contains(path),
+                "navigation did not expand {path}"
+            );
+        }
+        let rows = manager.visible_tree_rows();
+        assert!(
+            rows.iter()
+                .any(|(path, _, expanded, _, _)| { path == "/srv/app/logs" && *expanded })
+        );
+        assert!(
+            rows.iter()
+                .any(|(path, _, _, _, _)| path == "/srv/app/logs/archive"),
+            "expanded current directory should expose its loaded children"
+        );
+    }
+
+    #[test]
+    fn tree_rows_mark_symlinked_directories() {
+        let mut manager = FileManager::new(None);
+        manager.cwd = "/".into();
+        manager.tree_expanded.insert("/".into());
+        let mut link = directory("link-dir");
+        link.is_symlink = true;
+        manager.tree_children.insert("/".into(), vec![link]);
+
+        let rows = manager.visible_tree_rows();
+        assert!(
+            rows.iter()
+                .any(|(path, _, _, _, is_link)| path == "/link-dir" && *is_link),
+            "目录树应把符号链接目录标记出来"
+        );
+    }
+
+    #[test]
+    fn tree_selection_keeps_the_selected_node_collapsed() {
+        let mut manager = FileManager::new(None);
+        manager.cwd = "/".into();
+        manager.tree_expanded.clear();
+        manager
+            .tree_children
+            .insert("/".into(), vec![directory("srv")]);
+        manager
+            .tree_children
+            .insert("/srv".into(), vec![directory("app")]);
+
+        manager.select_tree_path("/srv");
+
+        assert_eq!(manager.cwd, "/srv");
+        assert!(manager.tree_expanded.contains("/"));
+        assert!(!manager.tree_expanded.contains("/srv"));
+        assert!(
+            manager
+                .visible_tree_rows()
+                .iter()
+                .all(|(path, _, _, _, _)| path != "/srv/app")
+        );
     }
 }

@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 use crate::app::{RShellApp, SessionKind};
 use crate::ui::icons::{Icon, icon_button};
 use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Sense, Stroke, StrokeKind, vec2};
@@ -9,7 +13,7 @@ impl RShellApp {
             ui.horizontal(|ui| {
                 // 连接库
                 if book_button(ui).clicked() {
-                    self.show_library = !self.show_library;
+                    self.open_connection_library_viewport();
                 }
                 // 新建 SSH 启动页标签，不再弹出连接表单。
                 if new_ssh_button(ui).clicked() {
@@ -137,10 +141,7 @@ impl RShellApp {
                         ui.visuals().text_color(),
                     );
                     if resp.clicked() {
-                        self.show_settings = !self.show_settings;
-                        if self.show_settings && self.settings_sub.is_none() {
-                            self.settings_sub = Some(crate::ui::settings::SettingsPage::General);
-                        }
+                        self.open_settings_viewport();
                     }
                 });
             });

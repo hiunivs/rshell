@@ -1,19 +1,62 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 密码安全存储：可选择系统 keyring，或使用 AES-256-GCM 加密保存在 App 配置目录。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use aes_gcm::aead::{Aead, Generate, Key, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::config::PasswordStorage;
 
 const SERVICE: &str = "rshell";
 const KEYRING_BACKEND: u8 = 0;
 const APP_BACKEND: u8 = 1;
-static BACKEND: AtomicU8 = AtomicU8::new(APP_BACKEND);
+static BACKEND: AtomicU8 = AtomicU8::new(KEYRING_BACKEND);
+
+/// 进程内共享的明文秘密。克隆只增加引用计数，最后一个引用释放时
+/// `Zeroizing` 会清空底层字符串，避免 SSH 重连和独立传输连接制造多份长期副本。
+#[derive(Clone, Default)]
+pub struct SecretString(Arc<Zeroizing<String>>);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(Arc::new(Zeroizing::new(value.into())))
+    }
+
+    pub fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretString([REDACTED])")
+    }
+}
 
 #[derive(Serialize, Deserialize, Default)]
 struct EncryptedStore {
@@ -36,7 +79,7 @@ pub fn set(account: &str, password: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn get(account: &str) -> Option<String> {
+pub fn get(account: &str) -> Option<SecretString> {
     let storage = current_storage();
     get_from(storage, account).or_else(|| get_from(other_storage(storage), account))
 }
@@ -64,7 +107,7 @@ pub fn switch_backend(
         }
     }
     for (account, password) in &values {
-        set_in(to, account, password)?;
+        set_in(to, account, password.expose())?;
     }
     for (account, _) in &values {
         delete_from(from, account);
@@ -101,7 +144,7 @@ fn set_in(storage: PasswordStorage, account: &str, password: &str) -> Result<(),
     }
 }
 
-fn get_from(storage: PasswordStorage, account: &str) -> Option<String> {
+fn get_from(storage: PasswordStorage, account: &str) -> Option<SecretString> {
     match storage {
         PasswordStorage::SystemKeyring => keyring_get(account),
         PasswordStorage::AppEncrypted => app_get(account),
@@ -120,11 +163,12 @@ fn keyring_set(account: &str, password: &str) -> Result<(), String> {
     entry.set_password(password).map_err(|e| e.to_string())
 }
 
-fn keyring_get(account: &str) -> Option<String> {
+fn keyring_get(account: &str) -> Option<SecretString> {
     keyring::Entry::new(SERVICE, account)
         .ok()?
         .get_password()
         .ok()
+        .map(SecretString::from)
 }
 
 fn keyring_delete(account: &str) {
@@ -203,13 +247,15 @@ fn app_set(account: &str, password: &str) -> Result<(), String> {
     save_store(&store)
 }
 
-fn app_get(account: &str) -> Option<String> {
+fn app_get(account: &str) -> Option<SecretString> {
     let store = load_store()
         .inspect_err(|error| eprintln!("{error}"))
         .ok()?;
     let encoded = store.entries.get(account)?;
     let key = load_or_create_key().ok()?;
-    decrypt_value(&key, account, encoded).ok()
+    decrypt_value(&key, account, encoded)
+        .ok()
+        .map(SecretString::from)
 }
 
 fn app_delete(account: &str) {
@@ -283,9 +329,12 @@ mod tests {
     fn keyring_roundtrip() {
         let account = "rshell_test@127.0.0.1:22";
         keyring_delete(account);
-        assert_eq!(keyring_get(account), None);
+        assert!(keyring_get(account).is_none());
         keyring_set(account, "s3cret-测试").unwrap();
-        assert_eq!(keyring_get(account).as_deref(), Some("s3cret-测试"));
+        assert_eq!(
+            keyring_get(account).as_ref().map(SecretString::expose),
+            Some("s3cret-测试")
+        );
         keyring_delete(account);
     }
 }

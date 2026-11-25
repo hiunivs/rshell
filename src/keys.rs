@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 受管理的 SSH 密钥:生成 / 登记 / 删除 / 连接时解析。
 //! 生成或登记的私钥文件实际路径记在 `SavedKey.path`。
 //! 生成的密钥写入 `<config>/keys/<id>`(unix 0600)+ 同名 `.pub`。
@@ -192,7 +196,10 @@ pub fn repoint(
 }
 
 /// 连接时解析:(展开后的路径, keyring 中的口令)
-pub fn load_for_connect(key_id: &str, cfg: &AppConfig) -> Option<(String, Option<String>)> {
+pub fn load_for_connect(
+    key_id: &str,
+    cfg: &AppConfig,
+) -> Option<(String, Option<crate::secrets::SecretString>)> {
     let k = cfg.keys.iter().find(|k| k.id == key_id)?;
     let path = expand_tilde(&k.path);
     let pass = crate::secrets::get(&key_account(&k.id));

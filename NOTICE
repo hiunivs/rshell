@@ -1,0 +1,43 @@
+RShell licensing notice
+=======================
+
+Copyright (C) 2026 hiunivs
+
+RShell is offered under a dual-licensing model. You may use the RShell
+copyrighted material under either:
+
+1. the GNU Affero General Public License, version 3 only
+   (AGPL-3.0-only), as reproduced in the LICENSE file, together with the
+   attribution term below; or
+2. a separate written commercial license executed by hiunivs.
+
+No commercial-license rights are granted by this notice. A commercial
+license is effective only when it is set out in a separate written agreement
+executed by the licensor.
+
+Section 7(b) attribution term
+-----------------------------
+
+For use under AGPL-3.0-only, the following additional term is added under
+section 7(b) of that license:
+
+Any covered work that has an interactive user interface must preserve an
+easily accessible, legible legal notice in its About, Credits, or Help view,
+or in a comparably prominent location. The notice must contain:
+
+    Based on RShell
+    Copyright (C) 2026 hiunivs
+    https://github.com/hiunivs/rshell
+
+Additional attribution may be displayed, but the notice above may not be
+removed, hidden, or obscured. Non-interactive distributions must preserve the
+same attribution in their accompanying legal notices or documentation.
+
+The names "RShell" and "hiunivs" and their logos are not licensed for use as
+trademarks, and this notice grants no right to imply endorsement by hiunivs.
+Modified versions should identify themselves as modified and must not
+misrepresent their origin.
+
+Project source: https://github.com/hiunivs/rshell
+Commercial licensing: ai-cube@outlook.com
+

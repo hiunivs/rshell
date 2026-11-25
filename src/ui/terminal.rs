@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 use crate::app::RShellApp;
 use crate::config::TerminalBackgroundKind;
 use crate::ui::icons::{Icon, icon_button};
@@ -184,18 +188,22 @@ impl RShellApp {
     fn show_cmd_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
+            // 有弹窗时命令输入条也不能接收按键：它通常画在弹窗之后，
+            // 保留焦点时回车会把命令直接发进 shell。
+            let modal_blocked = crate::ui::dialog::modal_keyboard_blocked(ui.ctx());
             // 右侧固定控件(历史/设置/选项/连接图标)预留宽度。
             // TextEdit 用 desired_width(INFINITY) 会把后面的控件挤出可视区
-            let reserved = 170.0;
+            let reserved = 194.0;
             let input_w = (ui.available_width() - reserved).max(80.0);
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.cmd_input)
                     .hint_text("命令输入(回车发送,↑↓ 历史)")
-                    .desired_width(input_w),
+                    .desired_width(input_w)
+                    .interactive(!modal_blocked),
             );
 
             // ↑↓ 翻阅命令历史
-            if resp.has_focus() {
+            if !modal_blocked && resp.has_focus() {
                 let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
                 let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
                 if up && !self.cmd_history.is_empty() {
@@ -216,7 +224,8 @@ impl RShellApp {
             }
 
             // 回车:发送到当前会话终端
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if !modal_blocked && resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            {
                 let cmd = std::mem::take(&mut self.cmd_input);
                 if !cmd.is_empty() {
                     self.push_cmd_history(&cmd);
@@ -229,6 +238,7 @@ impl RShellApp {
 
             // 历史菜单
             ui.menu_button("历史", |ui| {
+                crate::ui::dialog::mark_modal(ui.ctx());
                 if self.cmd_history.is_empty() {
                     ui.label(RichText::new("（空）").weak());
                 }
@@ -299,6 +309,32 @@ impl RShellApp {
                     } else {
                         session.reconnect(&ctx);
                     }
+                }
+            }
+            // 文件窗展开/收起。这里只改变 egui 的区域划分，不发送原生窗口
+            // resize；隐藏后 CentralPanel 会自然扩展到主窗口底部。
+            let (file_panel_icon, file_panel_tip) = if self.file_manager_visible {
+                (Icon::ChevronDown, "收起文件窗")
+            } else {
+                (Icon::ChevronUp, "展开文件窗")
+            };
+            if icon_button(
+                ui,
+                file_panel_icon,
+                file_panel_tip,
+                egui::vec2(22.0, 20.0),
+                15.0,
+                ui.visuals().text_color(),
+            )
+            .clicked()
+            {
+                self.file_manager_visible = !self.file_manager_visible;
+                if let Some(term) = self
+                    .sessions
+                    .get_mut(self.active)
+                    .and_then(|session| session.term.as_mut())
+                {
+                    term.request_focus();
                 }
             }
         });

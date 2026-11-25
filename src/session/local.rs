@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 本地 shell 会话:portable-pty 起一个伪终端,读写各用一个线程。
 
 use std::io::{Read, Write};
@@ -149,6 +153,7 @@ mod tests {
                 Ok(SessionEvent::Metrics(_)) => {}
                 Ok(SessionEvent::Sftp(_)) => {}
                 Ok(SessionEvent::VerifyHostKey(_)) => {}
+                Ok(SessionEvent::KeyboardInteractive(_)) => {}
                 Err(_) => {}
             }
         }

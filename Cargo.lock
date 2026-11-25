@@ -4663,6 +4663,7 @@ dependencies = [
  "anyhow",
  "argon2 0.5.3",
  "base64",
+ "bytes",
  "directories",
  "eframe",
  "egui",
@@ -4673,6 +4674,7 @@ dependencies = [
  "fontdb",
  "image",
  "keyring",
+ "libc",
  "log",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
@@ -4690,6 +4692,7 @@ dependencies = [
  "tokio",
  "toml",
  "url",
+ "zeroize",
 ]
 
 [[package]]

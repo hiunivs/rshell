@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 pub mod files;
 pub mod local;
 pub mod monitor;
@@ -27,6 +31,8 @@ pub enum SessionEvent {
     Sftp(files::SftpEvent),
     /// 主机指纹需要用户确认(首次连接或指纹变更)
     VerifyHostKey(Box<HostKeyPrompt>),
+    /// SSH Keyboard-Interactive/PAM/2FA 认证问题。
+    KeyboardInteractive(Box<KeyboardInteractivePrompt>),
 }
 
 /// 主机指纹确认请求:session 线程发出后阻塞等待 UI 通过 reply 回复
@@ -46,6 +52,29 @@ pub enum HostKeyVerdict {
     AcceptAndSave,
 }
 
+pub struct KeyboardInteractiveQuestion {
+    pub prompt: String,
+    pub echo: bool,
+}
+
+/// Keyboard-Interactive 请求同时携带 UI 的短期响应缓冲。
+/// 弹窗关闭或提交后 `Zeroizing` 会清空这些明文。
+pub struct KeyboardInteractivePrompt {
+    pub host: String,
+    pub user: String,
+    pub name: String,
+    pub instructions: String,
+    pub questions: Vec<KeyboardInteractiveQuestion>,
+    pub responses: Vec<zeroize::Zeroizing<String>>,
+    pub focus_first: bool,
+    pub reply: tokio::sync::oneshot::Sender<KeyboardInteractiveVerdict>,
+}
+
+pub enum KeyboardInteractiveVerdict {
+    Cancel,
+    Responses(Vec<crate::secrets::SecretString>),
+}
+
 /// 命令通道:tokio unbounded —— UI 线程同步 send,session 侧可 async recv
 pub type CmdTx = tokio::sync::mpsc::UnboundedSender<SessionCmd>;
 pub type CmdRx = tokio::sync::mpsc::UnboundedReceiver<SessionCmd>;
@@ -61,13 +90,13 @@ pub fn cmd_channel() -> (CmdTx, CmdRx) {
 /// 循环投递一次重绘请求。
 #[derive(Clone)]
 pub struct DataTx {
-    inner: tokio::sync::mpsc::Sender<Vec<u8>>,
+    inner: tokio::sync::mpsc::Sender<bytes::Bytes>,
     repaint_pending: Arc<AtomicBool>,
     ctx: egui::Context,
 }
 
 pub struct DataRx {
-    inner: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    inner: tokio::sync::mpsc::Receiver<bytes::Bytes>,
     repaint_pending: Arc<AtomicBool>,
     ctx: egui::Context,
 }
@@ -75,8 +104,9 @@ pub struct DataRx {
 impl DataTx {
     pub async fn send(
         &self,
-        value: Vec<u8>,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        value: impl Into<bytes::Bytes>,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<bytes::Bytes>> {
+        let value = value.into();
         self.inner.send(value).await?;
         self.wake_ui_once();
         Ok(())
@@ -84,8 +114,9 @@ impl DataTx {
 
     pub fn blocking_send(
         &self,
-        value: Vec<u8>,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        value: impl Into<bytes::Bytes>,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<bytes::Bytes>> {
+        let value = value.into();
         self.inner.blocking_send(value)?;
         self.wake_ui_once();
         Ok(())
@@ -100,8 +131,9 @@ impl DataTx {
     #[cfg(test)]
     fn try_send(
         &self,
-        value: Vec<u8>,
-    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<Vec<u8>>> {
+        value: impl Into<bytes::Bytes>,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<bytes::Bytes>> {
+        let value = value.into();
         self.inner.try_send(value)?;
         self.wake_ui_once();
         Ok(())
@@ -109,7 +141,7 @@ impl DataTx {
 }
 
 impl DataRx {
-    pub fn try_recv(&mut self) -> Result<Vec<u8>, tokio::sync::mpsc::error::TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<bytes::Bytes, tokio::sync::mpsc::error::TryRecvError> {
         self.inner.try_recv()
     }
 

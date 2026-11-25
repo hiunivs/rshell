@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 连接与界面配置的读写：使用平台标准 App 配置目录。
 //! 密码不写入此文件，由 secrets 模块按安全设置保存。
 
@@ -30,8 +34,8 @@ pub const TERMINAL_BACKGROUND_PRESETS: [[u8; 3]; 3] = [
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PasswordStorage {
-    SystemKeyring,
     #[default]
+    SystemKeyring,
     AppEncrypted,
 }
 
@@ -178,6 +182,10 @@ pub struct EditorSettings {
     pub remember_open_files: bool,
     /// 编辑器正文超过可用宽度时自动折行。
     pub auto_wrap: bool,
+    /// 深色模式下的语法高亮主题(syntect 主题名或 .tmTheme 文件名,空 = 内建默认)。
+    pub highlight_theme_dark: String,
+    /// 浅色模式下的语法高亮主题(同上)。
+    pub highlight_theme_light: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -639,7 +647,7 @@ key_path = ""
         assert!(cfg.common_commands.is_empty());
         assert!(cfg.connection_usage.is_empty());
         assert!(cfg.window_size().is_none());
-        assert_eq!(cfg.password_storage, PasswordStorage::AppEncrypted);
+        assert_eq!(cfg.password_storage, PasswordStorage::SystemKeyring);
         assert_eq!(cfg.terminal_background.kind, TerminalBackgroundKind::Solid);
         assert_eq!(cfg.terminal_background.color, [0x1B, 0x2B, 0x3A]);
         assert_eq!(cfg.terminal_background.image_darkness, 45);

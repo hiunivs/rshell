@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 hiunivs
+// SPDX-License-Identifier: AGPL-3.0-only
+// Alternative commercial licensing and AGPL section 7 terms: see NOTICE.
+
 //! 隔离实验:egui Panel 侧栏拖拽后宽度是否保持(不依赖 RShellApp)
 
 #[cfg(test)]
