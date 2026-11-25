@@ -107,6 +107,8 @@ fn main() -> eframe::Result<()> {
             // - warn_if_rect_changes_id:同一矩形上的控件 id 逐帧变化时画纯红 2px 框
             //   (egui_extras 表格单元格的 unique_id 含创建序号,可见行范围一挪就全变,
             //   拖分隔条/滚动时正是这样,纯属误报)
+            // Style.debug 仅在 debug_assertions 开启时存在,release 构建必须跳过。
+            #[cfg(debug_assertions)]
             cc.egui_ctx.all_styles_mut(|s| {
                 s.debug.show_unaligned = false;
                 s.debug.warn_if_rect_changes_id = false;
