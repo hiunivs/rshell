@@ -238,7 +238,7 @@ openssl base64 -A -in rshell-sparkle-private-key
 | `SPARKLE_PUBLIC_KEY` | `generate_keys` 输出的 Base64 公钥 |
 | `SPARKLE_PRIVATE_KEY_BASE64` | 导出的私钥文件的单行 Base64 |
 
-构建时，公钥会写入 App 的 `SUPublicEDKey`；CI 会解码私钥并用 `generate_keys -f` 导入临时钥匙串，再由 `generate_appcast` 签署更新 ZIP 和 `appcast.xml`。
+构建时，公钥会写入 App 的 `SUPublicEDKey`；CI 解码私钥文件后通过 `generate_appcast --ed-key-file` 直接读取并签署更新 ZIP 和 `appcast.xml`，不经过钥匙串，避免无头 runner 上出现交互式授权弹窗。
 
 必须离线备份 Sparkle 私钥。第一个正式版本发布后，不要直接重新生成并替换密钥，因为已安装的旧版本仍然内置原公钥；需要更换时必须使用 Sparkle 的密钥轮换流程。
 

@@ -24,8 +24,17 @@ if ! find "$ARCHIVE_DIR" -maxdepth 1 -name 'RShell-*.zip' -print -quit | grep -q
     exit 1
 fi
 
+# RSHELL_SPARKLE_PRIVATE_KEY_FILE optionally points at the exported EdDSA private
+# key file. Using it avoids interactive Keychain ACL prompts on headless CI
+# runners; without it the key is read from the login Keychain as usual.
+ED_KEY_ARGS=()
+if [[ -n "${RSHELL_SPARKLE_PRIVATE_KEY_FILE:-}" ]]; then
+    ED_KEY_ARGS+=(--ed-key-file "$RSHELL_SPARKLE_PRIVATE_KEY_FILE")
+fi
+
 "$SPARKLE_BIN_DIR/generate_appcast" \
     --download-url-prefix "$RSHELL_MACOS_DOWNLOAD_PREFIX" \
+    "${ED_KEY_ARGS[@]}" \
     "$ARCHIVE_DIR"
 
 APPCAST="$ARCHIVE_DIR/appcast.xml"

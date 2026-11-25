@@ -167,8 +167,10 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$RELEASE_KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           security default-keychain -d user -s "$KEYCHAIN"
-          "$SPARKLE_BIN_DIR/generate_keys" -f "$SPARKLE_KEY"
+          # The Sparkle private key stays a file: generate_appcast reads it via
+          # --ed-key-file, so no interactive Keychain ACL prompt can hang CI.
           echo "RSHELL_RELEASE_KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "RSHELL_SPARKLE_PRIVATE_KEY_FILE=$SPARKLE_KEY" >> "$GITHUB_ENV"
 
       - name: Build and sign macOS app
         shell: bash
