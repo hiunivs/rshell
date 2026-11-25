@@ -1,5 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict/>
+<dict>
+    <!-- Self-signed certificates have no Team ID, so hardened-runtime library
+         validation would reject every embedded dylib (including Sparkle).
+         Sparkle still verifies updates via EdDSA and code-signing consistency. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
 </plist>

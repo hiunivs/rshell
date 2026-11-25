@@ -88,6 +88,18 @@ lipo -create \
 chmod 755 "$WORK_DIR/RShell.app/Contents/MacOS/rshell"
 ditto "$SPARKLE_FRAMEWORK_PATH" "$WORK_DIR/RShell.app/Contents/Frameworks/Sparkle.framework"
 cp "$ROOT_DIR/packaging/macos/Info.plist" "$WORK_DIR/RShell.app/Contents/Info.plist"
+
+# Render the app icon with the stock Swift toolchain and pack it as icns.
+ICON_PNG="$WORK_DIR/AppIcon-1024.png"
+ICONSET="$WORK_DIR/AppIcon.iconset"
+swift "$ROOT_DIR/packaging/macos/make_icon.swift" "$ICON_PNG"
+mkdir -p "$ICONSET"
+for SIDE in 16 32 128 256 512; do
+    DOUBLE=$((SIDE * 2))
+    sips -z "$SIDE" "$SIDE" "$ICON_PNG" --out "$ICONSET/icon_${SIDE}x${SIDE}.png" >/dev/null
+    sips -z "$DOUBLE" "$DOUBLE" "$ICON_PNG" --out "$ICONSET/icon_${SIDE}x${SIDE}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$WORK_DIR/RShell.app/Contents/Resources/AppIcon.icns"
 cp "$ROOT_DIR/LICENSE" "$LICENSES_DIR/RShell-AGPL-3.0-only.txt"
 cp "$ROOT_DIR/NOTICE" "$LICENSES_DIR/RShell-NOTICE.txt"
 cp "$ROOT_DIR/COMMERCIAL-LICENSE.md" "$LICENSES_DIR/RShell-COMMERCIAL-LICENSING.md"
