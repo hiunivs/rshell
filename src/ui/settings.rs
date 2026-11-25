@@ -10,7 +10,6 @@ use crate::config::{
 };
 use egui::{Color32, CornerRadius, Frame, Margin, RichText, Stroke, ThemePreference, Ui, vec2};
 
-const RSHELL_ATTRIBUTION: &str = "Based on RShell";
 const RSHELL_COPYRIGHT: &str = "Copyright (C) 2026 hiunivs";
 const RSHELL_SOURCE_URL: &str = "https://github.com/hiunivs/rshell";
 const RSHELL_LICENSE_URL: &str = "https://github.com/hiunivs/rshell/blob/master/LICENSE";
@@ -36,7 +35,7 @@ impl SettingsPage {
             Self::Editor => "编辑器",
             Self::Security => "安全",
             Self::Shortcuts => "快捷设置",
-            Self::Updates => "软件更新",
+            Self::Updates => "更新",
             Self::Help => "帮助",
             Self::About => "关于",
         }
@@ -807,10 +806,7 @@ impl RShellApp {
             ui.add_space(12.0);
             let channel = self.config.updates.channel;
             let enabled = self.updater.is_available(channel);
-            let response = ui.add_enabled(
-                enabled,
-                egui::Button::new("检查更新").min_size(vec2(112.0, 30.0)),
-            );
+            let response = ui.add_enabled(enabled, egui::Button::new("检查更新"));
             if response.clicked()
                 && let Ok(action) = self.updater.check_for_updates(channel)
                 && let crate::update::UpdateAction::OpenUrl(url) = action
@@ -1062,15 +1058,9 @@ fn show_about_settings_page(ui: &mut Ui) {
             );
             ui.add_space(10.0);
             ui.label("轻量、可靠的 SSH 终端与服务器管理工具");
-            ui.label(
-                RichText::new("Rust · egui · russh")
-                    .color(secondary)
-                    .size(11.0),
-            );
             ui.add_space(12.0);
             ui.separator();
             ui.add_space(8.0);
-            ui.label(RichText::new(RSHELL_ATTRIBUTION).strong());
             ui.label(RichText::new(RSHELL_COPYRIGHT).color(secondary).size(11.0));
             ui.label(
                 RichText::new("社区版按 GNU AGPL v3 授权；不提供任何担保")

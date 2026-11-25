@@ -130,7 +130,6 @@ mod tests {
         }
         harness.run_steps(3);
 
-        assert!(harness.get_by_label("Based on RShell").rect().is_positive());
         assert!(
             harness
                 .get_by_label("Copyright (C) 2026 hiunivs")
