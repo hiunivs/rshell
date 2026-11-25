@@ -66,7 +66,7 @@ impl UpdateManager {
             automatic_checks: settings.automatic_checks,
         };
         manager.status = match manager.activate(settings.channel) {
-            Ok(()) => "已就绪".to_owned(),
+            Ok(()) => String::new(),
             Err(error) => error,
         };
         manager

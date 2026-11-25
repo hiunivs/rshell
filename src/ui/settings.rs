@@ -806,13 +806,15 @@ impl RShellApp {
             ui.add_space(12.0);
             let channel = self.config.updates.channel;
             let enabled = self.updater.is_available(channel);
-            let response = ui.add_enabled(enabled, egui::Button::new("检查更新"));
-            if response.clicked()
-                && let Ok(action) = self.updater.check_for_updates(channel)
-                && let crate::update::UpdateAction::OpenUrl(url) = action
-            {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-            }
+            ui.vertical_centered(|ui| {
+                let response = ui.add_enabled(enabled, egui::Button::new("检查更新"));
+                if response.clicked()
+                    && let Ok(action) = self.updater.check_for_updates(channel)
+                    && let crate::update::UpdateAction::OpenUrl(url) = action
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+            });
 
             ui.add_space(9.0);
             let status = self.updater.status();
@@ -966,7 +968,11 @@ fn settings_section_frame(ui: &Ui) -> Frame {
 }
 
 fn settings_row_label(ui: &mut Ui, title: &str) {
-    ui.add_sized([104.0, 24.0], egui::Label::new(title));
+    // 与右侧控件同高并垂直居中,避免 Grid 行内标题偏上或偏下。
+    ui.scope(|ui| {
+        ui.style_mut().override_text_valign = Some(egui::Align::Center);
+        ui.add_sized([104.0, 28.0], egui::Label::new(title));
+    });
 }
 
 fn settings_toggle(ui: &mut Ui, value: &mut bool) -> egui::Response {
