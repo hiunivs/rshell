@@ -162,7 +162,7 @@ try {
     & $MakeAppx pack /d $PackageDir /p $MsixPath /o
     Assert-NativeSuccess "Creating MSIX"
 
-    $BundleName = "RShell-$SemVer.msixbundle"
+    $BundleName = "RShell-$SemVer-windows-$Architecture.msixbundle"
     $CandidateBundlePath = Join-Path $StageDir $BundleName
     & $MakeAppx bundle /d $BundleInputDir /p $CandidateBundlePath /o
     Assert-NativeSuccess "Creating MSIX bundle"

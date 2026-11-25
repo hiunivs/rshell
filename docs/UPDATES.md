@@ -129,7 +129,7 @@ $env:RSHELL_WINDOWS_PFX_PASSWORD = "<从 CI/本机 secret manager 注入>"
 输出：
 
 ```text
-dist/windows/stable/RShell-<version>.msixbundle
+dist/windows/stable/RShell-<version>-windows-x64.msixbundle
 dist/windows/stable/RShell.appinstaller
 dist/source/RShell-<version>-source.zip
 ```
@@ -313,12 +313,12 @@ publish:                         true
 
 ```text
 macOS:
-RShell-<version>.zip
+RShell-<version>-macos-universal.zip
 RShell-<version>-source.tar.gz
 appcast.xml
 
 Windows:
-RShell-<version>.msixbundle
+RShell-<version>-windows-x64.msixbundle
 RShell.appinstaller
 RShell-<version>-source.zip
 ```

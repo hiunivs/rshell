@@ -317,9 +317,9 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v$VERSION"
-          MACOS_ZIP="$(find artifacts/macos -name "RShell-$VERSION.zip" -print -quit)"
+          MACOS_ZIP="$(find artifacts/macos -name "RShell-$VERSION-macos-universal.zip" -print -quit)"
           MACOS_SOURCE="$(find artifacts/macos -name "RShell-$VERSION-source.tar.gz" -print -quit)"
-          MSIX="$(find artifacts/windows -name "RShell-$VERSION.msixbundle" -print -quit)"
+          MSIX="$(find artifacts/windows -name "RShell-$VERSION-windows-*.msixbundle" -print -quit)"
           WINDOWS_SOURCE="$(find artifacts/windows -name "RShell-$VERSION-source.zip" -print -quit)"
           : "${MACOS_ZIP:?}"; : "${MACOS_SOURCE:?}"; : "${MSIX:?}"; : "${WINDOWS_SOURCE:?}"
           # No --clobber here: re-publishing a different binary under an existing
@@ -332,8 +332,8 @@ jobs:
           set -euo pipefail
           APPCAST="$(find artifacts/macos -name appcast.xml -print -quit)"
           APPINSTALLER="$(find artifacts/windows -name RShell.appinstaller -print -quit)"
-          MACOS_ZIP="$(find artifacts/macos -name "RShell-$VERSION.zip" -print -quit)"
-          MSIX="$(find artifacts/windows -name "RShell-$VERSION.msixbundle" -print -quit)"
+          MACOS_ZIP="$(find artifacts/macos -name "RShell-$VERSION-macos-universal.zip" -print -quit)"
+          MSIX="$(find artifacts/windows -name "RShell-$VERSION-windows-*.msixbundle" -print -quit)"
           : "${APPCAST:?}"; : "${APPINSTALLER:?}"; : "${MACOS_ZIP:?}"; : "${MSIX:?}"
           for CHANNEL in "$MACOS_CHANNEL" "$WINDOWS_CHANNEL"; do
             if ! gh release view "$CHANNEL" >/dev/null 2>&1; then

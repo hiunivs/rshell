@@ -161,7 +161,7 @@ mkdir -p "$DIST_DIR" "$SOURCE_DIST_DIR"
 rm -rf "$APP_PATH"
 ditto "$WORK_DIR/RShell.app" "$APP_PATH"
 ditto -c -k --sequesterRsrc --keepParent \
-    "$WORK_DIR/RShell.app" "$DIST_DIR/RShell-$VERSION.zip"
+    "$WORK_DIR/RShell.app" "$DIST_DIR/RShell-$VERSION-macos-universal.zip"
 
 # Ship the exact tagged source together with all locked Cargo dependency
 # sources needed to rebuild it, so recipients do not depend on third-party
@@ -176,6 +176,6 @@ git -C "$ROOT_DIR" archive "$EXPECTED_TAG" | tar -x -C "$SOURCE_ROOT"
 tar -czf "$SOURCE_DIST_DIR/RShell-$VERSION-source.tar.gz" \
     -C "$WORK_DIR" "RShell-$VERSION"
 
-echo "Created $DIST_DIR/RShell-$VERSION.zip"
+echo "Created $DIST_DIR/RShell-$VERSION-macos-universal.zip"
 echo "Created $SOURCE_DIST_DIR/RShell-$VERSION-source.tar.gz"
 echo "Generate the signed appcast.xml with Sparkle's generate_appcast tool before publishing."
