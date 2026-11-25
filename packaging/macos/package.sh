@@ -15,10 +15,14 @@ EXPECTED_TAG="v$VERSION"
 : "${RSHELL_BUILD_NUMBER:?Set a monotonically increasing numeric build number}"
 : "${RSHELL_MACOS_APPCAST_URL:?Set the stable HTTPS appcast URL}"
 : "${RSHELL_SPARKLE_PUBLIC_KEY:?Set the Sparkle EdDSA public key}"
-: "${RSHELL_MACOS_SIGN_IDENTITY:?Set the Developer ID Application identity}"
-: "${RSHELL_APPLE_NOTARY_PROFILE:?Set the notarytool keychain profile}"
+: "${RSHELL_MACOS_SIGN_IDENTITY:?Set the signing identity (Developer ID or a persistent self-signed certificate)}"
 : "${SPARKLE_FRAMEWORK_PATH:?Point to the vetted Sparkle.framework directory}"
 : "${SPARKLE_LICENSE_PATH:?Point to the LICENSE file from the same vetted Sparkle distribution}"
+
+# Notarization is optional. Without an Apple Developer account, leave
+# RSHELL_APPLE_NOTARY_PROFILE unset: the app is still signed (a self-signed
+# certificate keeps Sparkle's code-signing consistency check working), but
+# Gatekeeper will ask first-time users to open it via right-click -> Open.
 
 case "$RSHELL_MACOS_APPCAST_URL" in
     https://*/appcast.xml) ;;
@@ -107,7 +111,7 @@ if [[ ! -d "$SPARKLE_VERSION_DIR" ]]; then
 fi
 
 # Sparkle distributions contain ad-hoc-signed helpers. A non-Xcode archive workflow must
-# re-sign nested code from the inside out with RShell's Developer ID. Do not use --deep for
+# re-sign nested code from the inside out with RShell's signing identity. Do not use --deep for
 # signing because the Downloader service has its own entitlements.
 codesign --force --timestamp --options runtime \
     --sign "$RSHELL_MACOS_SIGN_IDENTITY" \
@@ -137,17 +141,21 @@ codesign --force --timestamp --options runtime \
     "$WORK_DIR/RShell.app"
 codesign --verify --deep --strict --verbose=2 "$WORK_DIR/RShell.app"
 
-ditto -c -k --keepParent "$WORK_DIR/RShell.app" "$WORK_DIR/RShell-notarize.zip"
-NOTARY_KEYCHAIN_ARGS=()
-if [[ -n "${RSHELL_APPLE_NOTARY_KEYCHAIN:-}" ]]; then
-    NOTARY_KEYCHAIN_ARGS+=(--keychain "$RSHELL_APPLE_NOTARY_KEYCHAIN")
+if [[ -n "${RSHELL_APPLE_NOTARY_PROFILE:-}" ]]; then
+    ditto -c -k --keepParent "$WORK_DIR/RShell.app" "$WORK_DIR/RShell-notarize.zip"
+    NOTARY_KEYCHAIN_ARGS=()
+    if [[ -n "${RSHELL_APPLE_NOTARY_KEYCHAIN:-}" ]]; then
+        NOTARY_KEYCHAIN_ARGS+=(--keychain "$RSHELL_APPLE_NOTARY_KEYCHAIN")
+    fi
+    xcrun notarytool submit "$WORK_DIR/RShell-notarize.zip" --wait \
+        --keychain-profile "$RSHELL_APPLE_NOTARY_PROFILE" "${NOTARY_KEYCHAIN_ARGS[@]}"
+    xcrun stapler staple "$WORK_DIR/RShell.app"
+    xcrun stapler validate "$WORK_DIR/RShell.app"
+    codesign --verify --deep --strict --verbose=2 "$WORK_DIR/RShell.app"
+    spctl --assess --type execute --verbose=2 "$WORK_DIR/RShell.app"
+else
+    echo "RSHELL_APPLE_NOTARY_PROFILE not set; skipping notarization (self-signed distribution)."
 fi
-xcrun notarytool submit "$WORK_DIR/RShell-notarize.zip" --wait \
-    --keychain-profile "$RSHELL_APPLE_NOTARY_PROFILE" "${NOTARY_KEYCHAIN_ARGS[@]}"
-xcrun stapler staple "$WORK_DIR/RShell.app"
-xcrun stapler validate "$WORK_DIR/RShell.app"
-codesign --verify --deep --strict --verbose=2 "$WORK_DIR/RShell.app"
-spctl --assess --type execute --verbose=2 "$WORK_DIR/RShell.app"
 
 mkdir -p "$DIST_DIR" "$SOURCE_DIST_DIR"
 rm -rf "$APP_PATH"

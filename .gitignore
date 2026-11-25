@@ -1,5 +1,8 @@
 /target
 /dist
+/release
 .DS_Store
 **/.DS_Store
 *.pkg
+*.p12
+*.pfx
