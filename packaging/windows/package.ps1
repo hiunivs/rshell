@@ -178,8 +178,24 @@ try {
     } else {
         throw "Set RSHELL_WINDOWS_CERT_SHA1 or the PFX path/password; unsigned update packages are never copied to dist"
     }
-    & $SignTool verify /pa /v $CandidateBundlePath
-    Assert-NativeSuccess "Verifying MSIX bundle signature"
+    # A self-signed PFX is not rooted in the machine's trust store, so a plain
+    # signtool verify fails even though the signature itself is valid. Trust the
+    # certificate in the current user's root store just for verification and
+    # remove it immediately afterwards (CI runners are disposable).
+    $ImportedRootCert = $null
+    if ($env:RSHELL_WINDOWS_PFX_PATH -and $env:RSHELL_WINDOWS_PFX_PASSWORD -and -not $env:RSHELL_WINDOWS_CERT_SHA1) {
+        $PfxPassword = ConvertTo-SecureString $env:RSHELL_WINDOWS_PFX_PASSWORD -AsPlainText -Force
+        $ImportedRootCert = Import-PfxCertificate -FilePath $env:RSHELL_WINDOWS_PFX_PATH `
+            -Password $PfxPassword -CertStoreLocation Cert:\CurrentUser\Root
+    }
+    try {
+        & $SignTool verify /pa /v $CandidateBundlePath
+        Assert-NativeSuccess "Verifying MSIX bundle signature"
+    } finally {
+        if ($ImportedRootCert) {
+            Remove-Item -LiteralPath "Cert:\CurrentUser\Root\$($ImportedRootCert.Thumbprint)" -Force
+        }
+    }
 
     # Only a successfully signed and verified bundle may enter the publishing directory.
     $BundlePath = Join-Path $DistDir $BundleName
