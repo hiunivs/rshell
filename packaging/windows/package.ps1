@@ -95,12 +95,11 @@ cargo build --locked --release --target $Target --manifest-path (Join-Path $Root
 Assert-NativeSuccess "Building RShell"
 
 $DistDir = Join-Path $RootDir "dist/windows/$ReleaseChannel"
-$SourceDistDir = Join-Path $RootDir "dist/source"
 $StageDir = Join-Path $env:TEMP ("rshell-msix-" + [Guid]::NewGuid().ToString("N"))
 $PackageDir = Join-Path $StageDir "package"
 $BundleInputDir = Join-Path $StageDir "bundle"
 $LicensesDir = Join-Path $PackageDir "Licenses"
-New-Item -ItemType Directory -Force $PackageDir, (Join-Path $PackageDir "Assets"), $LicensesDir, $BundleInputDir, $DistDir, $SourceDistDir | Out-Null
+New-Item -ItemType Directory -Force $PackageDir, (Join-Path $PackageDir "Assets"), $LicensesDir, $BundleInputDir, $DistDir | Out-Null
 
 try {
     Copy-Item (Join-Path $RootDir "target/$Target/release/rshell.exe") (Join-Path $PackageDir "rshell.exe")
@@ -213,30 +212,8 @@ try {
     $AppInstaller = $AppInstaller.Replace("__BUNDLE_URL__", [Security.SecurityElement]::Escape($BundleUrl))
     Set-Content (Join-Path $DistDir "RShell.appinstaller") $AppInstaller -Encoding utf8
 
-    # Ship the exact tagged source together with all locked Cargo dependency
-    # sources needed to rebuild it.
-    $SourceRoot = Join-Path $StageDir "RShell-$SemVer"
-    $SourceTar = Join-Path $StageDir "rshell-source.tar"
-    New-Item -ItemType Directory -Force $SourceRoot, (Join-Path $SourceRoot ".cargo") | Out-Null
-    & git -C $RootDir archive --format=tar --output=$SourceTar $ExpectedTag
-    Assert-NativeSuccess "Exporting tagged source"
-    & tar -xf $SourceTar -C $SourceRoot
-    Assert-NativeSuccess "Extracting tagged source"
-    Push-Location $SourceRoot
-    try {
-        $VendorConfig = & cargo vendor --locked --versioned-dirs vendor
-        Assert-NativeSuccess "Vendoring locked dependency sources"
-        $VendorConfig | Set-Content (Join-Path $SourceRoot ".cargo/config.toml") -Encoding utf8
-    } finally {
-        Pop-Location
-    }
-    $SourceArchive = Join-Path $SourceDistDir "RShell-$SemVer-source.zip"
-    & tar -a -cf $SourceArchive -C $StageDir "RShell-$SemVer"
-    Assert-NativeSuccess "Creating corresponding source archive"
-
     Write-Host "Created $BundlePath"
     Write-Host "Created $(Join-Path $DistDir 'RShell.appinstaller')"
-    Write-Host "Created $SourceArchive"
 } finally {
     if (Test-Path $StageDir) { Remove-Item -Recurse -Force $StageDir }
 }

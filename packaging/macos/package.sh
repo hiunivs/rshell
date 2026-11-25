@@ -7,7 +7,6 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist/macos"
-SOURCE_DIST_DIR="$ROOT_DIR/dist/source"
 APP_PATH="$DIST_DIR/RShell.app"
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -1)"
 EXPECTED_TAG="v$VERSION"
@@ -169,25 +168,13 @@ else
     echo "RSHELL_APPLE_NOTARY_PROFILE not set; skipping notarization (self-signed distribution)."
 fi
 
-mkdir -p "$DIST_DIR" "$SOURCE_DIST_DIR"
+mkdir -p "$DIST_DIR"
 rm -rf "$APP_PATH"
 ditto "$WORK_DIR/RShell.app" "$APP_PATH"
 ditto -c -k --sequesterRsrc --keepParent \
     "$WORK_DIR/RShell.app" "$DIST_DIR/RShell-$VERSION-macos-universal.zip"
 
-# Ship the exact tagged source together with all locked Cargo dependency
-# sources needed to rebuild it, so recipients do not depend on third-party
-# registries remaining available.
-SOURCE_ROOT="$WORK_DIR/RShell-$VERSION"
-mkdir -p "$SOURCE_ROOT/.cargo"
-git -C "$ROOT_DIR" archive "$EXPECTED_TAG" | tar -x -C "$SOURCE_ROOT"
-(
-    cd "$SOURCE_ROOT"
-    cargo vendor --locked --versioned-dirs vendor > .cargo/config.toml
-)
-tar -czf "$SOURCE_DIST_DIR/RShell-$VERSION-source.tar.gz" \
-    -C "$WORK_DIR" "RShell-$VERSION"
-
+# The tagged Git source plus Cargo.lock already satisfies the corresponding-source
+# obligation; GitHub also provides automatic source snapshots for every tag.
 echo "Created $DIST_DIR/RShell-$VERSION-macos-universal.zip"
-echo "Created $SOURCE_DIST_DIR/RShell-$VERSION-source.tar.gz"
 echo "Generate the signed appcast.xml with Sparkle's generate_appcast tool before publishing."

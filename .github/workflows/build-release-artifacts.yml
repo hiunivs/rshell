@@ -200,7 +200,6 @@ jobs:
           name: rshell-macos-${{ inputs.macos_release_channel }}-${{ inputs.build_number }}
           path: |
             dist/macos/RShell-*.zip
-            dist/source/RShell-*-source.tar.gz
             dist/macos/appcast.xml
             dist/macos/*.delta
           if-no-files-found: error
@@ -269,7 +268,6 @@ jobs:
           name: rshell-windows-${{ inputs.windows_release_channel }}-${{ inputs.build_number }}
           path: |
             dist/windows/${{ inputs.windows_release_channel }}/*
-            dist/source/RShell-*-source.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -318,13 +316,13 @@ jobs:
           set -euo pipefail
           TAG="v$VERSION"
           MACOS_ZIP="$(find artifacts/macos -name "RShell-$VERSION-macos-universal.zip" -print -quit)"
-          MACOS_SOURCE="$(find artifacts/macos -name "RShell-$VERSION-source.tar.gz" -print -quit)"
           MSIX="$(find artifacts/windows -name "RShell-$VERSION-windows-*.msixbundle" -print -quit)"
-          WINDOWS_SOURCE="$(find artifacts/windows -name "RShell-$VERSION-source.zip" -print -quit)"
-          : "${MACOS_ZIP:?}"; : "${MACOS_SOURCE:?}"; : "${MSIX:?}"; : "${WINDOWS_SOURCE:?}"
+          : "${MACOS_ZIP:?}"; : "${MSIX:?}"
           # No --clobber here: re-publishing a different binary under an existing
           # version must fail instead of silently replacing released assets.
-          gh release upload "$TAG" "$MACOS_ZIP" "$MACOS_SOURCE" "$MSIX" "$WINDOWS_SOURCE"
+          # GitHub's automatic per-tag source snapshots serve as the
+          # corresponding source for these binaries.
+          gh release upload "$TAG" "$MACOS_ZIP" "$MSIX"
 
       - name: Update channel releases used by auto-update
         shell: bash

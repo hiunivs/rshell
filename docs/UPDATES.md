@@ -13,7 +13,8 @@ RShell 只统一更新设置和入口，不在主进程中下载、解压或覆�
 
 | 内容 | 位置 |
 | --- | --- |
-| 各版本安装包与源码归档 | `v<version>` Release（不可变资产，同名覆盖会失败） |
+| 各版本安装包 | `v<version>` Release（不可变资产，同名覆盖会失败） |
+| 对应源码 | GitHub 自动生成的 tag 源码快照 + 仓库内 `Cargo.lock`（依赖按锁定版本从 crates.io 获取） |
 | macOS 更新清单 | `stable`（或 `beta`）Release 中的 `appcast.xml`，每次发布原子替换 |
 | macOS 最新 ZIP | 同一 channel Release，下载前缀与 appcast 中 enclosure 地址一致 |
 | Windows 更新清单 | channel Release 中的 `RShell.appinstaller`，每次发布原子替换 |
@@ -65,7 +66,6 @@ export SPARKLE_LICENSE_PATH=/verified/LICENSE
 3. 把 RShell、Rust 依赖、字体、图标和 Sparkle 的许可证材料写入 App Bundle。
 4. 使用 Hardened Runtime 签名并验证整个 App Bundle。
 5. 生成最终 ZIP。
-6. 从当前版本 tag 导出源码并通过 `cargo vendor --locked` 一并收录依赖源码。
 
 如以后拥有 Apple Developer 账号，可额外设置 `RSHELL_MACOS_SIGN_IDENTITY` 为 Developer ID 身份并配置 `RSHELL_APPLE_NOTARY_PROFILE`（先用 `xcrun notarytool store-credentials` 创建 profile），脚本会自动恢复公证与 stapler 流程。注意更换签名证书会让旧版本的 Sparkle 签名校验失败，需要按 Sparkle 的签名迁移流程处理。
 
@@ -131,7 +131,6 @@ $env:RSHELL_WINDOWS_PFX_PASSWORD = "<从 CI/本机 secret manager 注入>"
 ```text
 dist/windows/stable/RShell-<version>-windows-x64.msixbundle
 dist/windows/stable/RShell.appinstaller
-dist/source/RShell-<version>-source.zip
 ```
 
 发布测试版时增加 `-ReleaseChannel beta`，产物会写入 `dist/windows/beta`；同一构建内的稳定版和测试版 URL 都是编译期固定值。CI 中 macOS 和 Windows 的产物通道分别选择，测试版通道必须填写对应的 beta URL。
@@ -149,7 +148,7 @@ GitHub Releases 会为 `.appinstaller`、`.msixbundle` 和 ZIP 提供稳定的 H
 - 自签名证书私钥、Sparkle EdDSA 私钥、PFX 密码分别保存；任何私钥都不能写入仓库或应用包。
 - CI 的 publish job 先上传 `v<version>` Release 的全部版本化资产，再原子替换 channel Release 中的 appcast/`.appinstaller`，保证清单不会先指向尚未上传的包。
 - `v<version>` Release 中的资产不可变：同名文件不能覆盖，重发同一版本必须先删除旧资产并重新走完整流程。
-- 对应的 `*-source.tar.gz` 或 `*-source.zip` 必须与二进制放在同一发布位置并保持可访问；只要仍提供该二进制，就不能提前删除其对应源码。
+- 只要仍在提供某个版本的二进制，其对应的 `v<version>` tag 与源码快照就不能删除。
 - 保留至少一个已知可用的旧安装包。回滚时发布版本号更高、内容恢复到旧实现的新包，不降低版本号。
 
 ## 必测场景
@@ -164,7 +163,7 @@ GitHub Releases 会为 `.appinstaller`、`.msixbundle` 和 ZIP 提供稳定的 H
 
 ## CI
 
-仓库包含一个只允许手动触发、绑定 `release` protected environment 的工作流：[build-release-artifacts.yml](../.github/workflows/build-release-artifacts.yml)。它构建并上传短期保留的签名产物，随后（默认 `publish=true`）自动创建 `v<version>` Release 并上传安装包与源码，最后更新 `stable`/`beta` channel Release 中的更新清单。整个发布过程不需要 Apple 凭据，也不需要自建更新服务器。
+仓库包含一个只允许手动触发、绑定 `release` protected environment 的工作流：[build-release-artifacts.yml](../.github/workflows/build-release-artifacts.yml)。它构建并上传短期保留的签名产物，随后（默认 `publish=true`）自动创建 `v<version>` Release 并上传安装包，最后更新 `stable`/`beta` channel Release 中的更新清单。整个发布过程不需要 Apple 凭据，也不需要自建更新服务器。
 
 ### 创建受保护的发布环境
 
@@ -314,13 +313,11 @@ publish:                         true
 ```text
 macOS:
 RShell-<version>-macos-universal.zip
-RShell-<version>-source.tar.gz
 appcast.xml
 
 Windows:
 RShell-<version>-windows-x64.msixbundle
 RShell.appinstaller
-RShell-<version>-source.zip
 ```
 
 工作流首先用固定版本的 `cargo-about` 重新生成 Rust 锁定依赖的许可证报告，并与仓库中的 `THIRD_PARTY_LICENSES.html` 比对；报告过期或出现未接受许可证时会中止发布。macOS 与 Windows 安装包都会携带项目许可证、第三方许可证报告以及直接嵌入资源的许可证正文。
