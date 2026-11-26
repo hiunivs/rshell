@@ -15,9 +15,12 @@ let canvas: CGFloat = 1024
 let image = NSImage(size: NSSize(width: canvas, height: canvas))
 image.lockFocus()
 
+// macOS icon grid: the rounded tile occupies 824x824 on the 1024 canvas.
+// Using the standard grid matters because setApplicationIconImage draws the
+// image as-is at runtime, without the system's icon scaling.
 let tile = NSBezierPath(
-    roundedRect: NSRect(x: 72, y: 72, width: 880, height: 880),
-    xRadius: 200, yRadius: 200
+    roundedRect: NSRect(x: 100, y: 100, width: 824, height: 824),
+    xRadius: 185, yRadius: 185
 )
 NSColor(calibratedRed: 0.10, green: 0.11, blue: 0.15, alpha: 1).setFill()
 tile.fill()
@@ -28,17 +31,17 @@ NSColor(calibratedRed: 0.42, green: 0.86, blue: 0.55, alpha: 1).setStroke()
 NSColor(calibratedRed: 0.42, green: 0.86, blue: 0.55, alpha: 1).setFill()
 
 let chevron = NSBezierPath()
-chevron.move(to: NSPoint(x: 294, y: 660))
-chevron.line(to: NSPoint(x: 504, y: 512))
-chevron.line(to: NSPoint(x: 294, y: 364))
-chevron.lineWidth = 76
+chevron.move(to: NSPoint(x: 308, y: 651))
+chevron.line(to: NSPoint(x: 405, y: 512))
+chevron.line(to: NSPoint(x: 308, y: 373))
+chevron.lineWidth = 71
 chevron.lineCapStyle = .round
 chevron.lineJoinStyle = .round
 chevron.stroke()
 
 let cursor = NSBezierPath(
-    roundedRect: NSRect(x: 585, y: 330, width: 220, height: 64),
-    xRadius: 16, yRadius: 16
+    roundedRect: NSRect(x: 580, y: 342, width: 206, height: 60),
+    xRadius: 15, yRadius: 15
 )
 cursor.fill()
 image.unlockFocus()

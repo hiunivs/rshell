@@ -1040,17 +1040,17 @@ fn paint_rshell_logo(painter: &egui::Painter, rect: egui::Rect) {
     let map = |x: f32, y: f32| rect.min + vec2(x * scale, y * scale);
     let green = Color32::from_rgb(0x6B, 0xDB, 0x8C);
     painter.rect_filled(
-        rect,
-        CornerRadius::same((200.0 * scale) as u8),
+        egui::Rect::from_min_max(map(100.0, 100.0), map(924.0, 924.0)),
+        CornerRadius::same((185.0 * scale) as u8),
         Color32::from_rgb(0x1A, 0x1C, 0x26),
     );
     painter.add(egui::Shape::line(
-        vec![map(294.0, 364.0), map(504.0, 512.0), map(294.0, 660.0)],
-        egui::Stroke::new(76.0 * scale, green),
+        vec![map(308.0, 373.0), map(405.0, 512.0), map(308.0, 651.0)],
+        egui::Stroke::new(71.0 * scale, green),
     ));
     painter.rect_filled(
-        egui::Rect::from_min_max(map(585.0, 630.0), map(805.0, 694.0)),
-        CornerRadius::same((16.0 * scale).max(1.0) as u8),
+        egui::Rect::from_min_max(map(580.0, 622.0), map(786.0, 682.0)),
+        CornerRadius::same((15.0 * scale).max(1.0) as u8),
         green,
     );
 }
