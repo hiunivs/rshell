@@ -32,9 +32,14 @@ if [[ -n "${RSHELL_SPARKLE_PRIVATE_KEY_FILE:-}" ]]; then
     ED_KEY_ARGS+=(--ed-key-file "$RSHELL_SPARKLE_PRIVATE_KEY_FILE")
 fi
 
+# Sparkle resolves archive names relative to the prefix URL. Without a trailing
+# slash the last path segment (e.g. "stable") is dropped as if it were a file,
+# producing broken download URLs, so always append one.
+RSHELL_MACOS_DOWNLOAD_PREFIX="${RSHELL_MACOS_DOWNLOAD_PREFIX%/}/"
+
 "$SPARKLE_BIN_DIR/generate_appcast" \
     --download-url-prefix "$RSHELL_MACOS_DOWNLOAD_PREFIX" \
-    "${ED_KEY_ARGS[@]}" \
+    ${ED_KEY_ARGS[@]+"${ED_KEY_ARGS[@]}"} \
     "$ARCHIVE_DIR"
 
 APPCAST="$ARCHIVE_DIR/appcast.xml"
