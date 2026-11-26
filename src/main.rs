@@ -80,6 +80,22 @@ pub(crate) fn force_font_texture_reupload(ctx: &egui::Context) {
     ctx.request_repaint();
 }
 
+/// 运行时应用图标。eframe 会在启动时调用 NSApplication.setApplicationIconImage，
+/// 不指定时会用 eframe 自带的黑白图标覆盖 App Bundle 的 icns，导致 Dock 图标
+/// 在启动后变化。这里嵌入与打包图标一致的 ">_" 图案。
+fn app_icon_data() -> egui::IconData {
+    let bytes = include_bytes!("../assets/app-icon.png");
+    let image = image::load_from_memory(bytes)
+        .expect("embedded app icon must decode")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let loaded_config = config::load();
     let initial_window_size = loaded_config.window_size().unwrap_or([1280.0, 800.0]);
@@ -87,6 +103,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("RShell")
             .with_app_id("com.rshell.rshell")
+            .with_icon(std::sync::Arc::new(app_icon_data()))
             .with_inner_size(initial_window_size)
             .with_min_inner_size([1024.0, 640.0])
             // macOS 原生标题栏使用透明材质，由 egui 背景提供一致的颜色。
